@@ -11,7 +11,7 @@ use anyhow::Result;
 use candle_core::{Device, Tensor};
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -636,11 +636,10 @@ impl SimpleResampler {
 
 pub fn ctrlc_handler(running: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let mut signals = signal_hook::iterator::Signals::new(&[signal_hook::consts::SIGINT])
+        let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGINT])
             .expect("Failed to create signal handler");
-        for _ in signals.forever() {
+        if signals.forever().next().is_some() {
             running.store(false, Ordering::SeqCst);
-            break;
         }
     });
 }
@@ -684,23 +683,16 @@ fn run_meeting_mode(
 
     let host = cpal::default_host();
 
-    // Find mic device (using cpal)
-    let mic = if let Some(name) = mic_device {
+    // Find mic device - use specified device or system default
+    let mic_device = if let Some(name) = mic_device {
         host.input_devices()?
             .find(|d| d.name().map(|n| n.contains(name)).unwrap_or(false))
+            .ok_or_else(|| anyhow::anyhow!("Mic '{}' not found. Use --list-devices to see available.", name))?
     } else {
-        // Try to find a real microphone (not BlackHole)
-        host.input_devices()?
-            .find(|d| {
-                d.name()
-                    .map(|n| n.contains("Microphone") || n.contains("Anker") || n.contains("Insta360"))
-                    .unwrap_or(false)
-            })
-            .or_else(|| host.default_input_device())
+        host.default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("No default input device. Use --mic to specify."))?
     };
-
-    let mic_device = mic.ok_or_else(|| anyhow::anyhow!("No microphone found. Use --mic to specify."))?;
-    let mic_name = mic_device.name().unwrap_or_default();
+    let mic_name = mic_device.name().unwrap_or_else(|_| "Unknown".into());
     eprintln!("Mic device: {}", mic_name);
     eprintln!("System audio: ScreenCaptureKit");
 
@@ -920,7 +912,7 @@ fn resolve_session_folder(output: Option<String>) -> Result<PathBuf> {
     Ok(folder)
 }
 
-fn run_diarization(session_dir: &PathBuf, hf_token: Option<&str>) -> Result<()> {
+fn run_diarization(session_dir: &Path, hf_token: Option<&str>) -> Result<()> {
     let audio_path = session_dir.join("audio_sys.wav");
     let events_path = session_dir.join("events.jsonl");
 
@@ -1057,7 +1049,7 @@ for turn, _, speaker in diarization.itertracks(yield_label=True):
     Ok(())
 }
 
-fn generate_summary(session_dir: &PathBuf, anthropic_key: Option<&str>) -> Result<()> {
+fn generate_summary(session_dir: &Path, anthropic_key: Option<&str>) -> Result<()> {
     let events_path = session_dir.join("events.jsonl");
     let context_path = session_dir.join("CONTEXT.md");
 
@@ -1184,10 +1176,35 @@ fn generate_summary(session_dir: &PathBuf, anthropic_key: Option<&str>) -> Resul
 
 /// Run diarization from in-memory audio samples (no files written to disk)
 fn run_diarization_from_memory(
-    session_dir: &PathBuf,
+    session_dir: &Path,
     sys_samples: &[f32],
     hf_token: Option<&str>,
 ) -> Result<()> {
+    // Check for required binaries
+    if std::process::Command::new("uv")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        anyhow::bail!(
+            "uv not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
+        );
+    }
+
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        anyhow::bail!(
+            "ffmpeg not found. Install with: brew install ffmpeg"
+        );
+    }
+
     let events_path = session_dir.join("events.jsonl");
 
     if !events_path.exists() {
@@ -1238,33 +1255,74 @@ fn run_diarization_from_memory(
     );
 
     // Python script that reads f32 samples from stdin
+    // Uses uv run with inline script dependencies
     let python_script = format!(
-        r#"
+        r#"# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "torch>=2.0,<2.8",
+#     "torchaudio",
+#     "pyannote.audio>=3.3,<4.0",
+# ]
+# ///
+
 import json
 import sys
 import struct
-import torch
-from pyannote.audio import Pipeline
+import time
 
-# Read raw f32 samples from stdin
+print("[diarize] Loading torch...", file=sys.stderr, flush=True)
+import torch
+
+# PyTorch 2.6+ changed weights_only default - allowlist required classes BEFORE importing pyannote
+if hasattr(torch.serialization, 'add_safe_globals'):
+    from omegaconf import ListConfig, DictConfig
+    torch.serialization.add_safe_globals([ListConfig, DictConfig])
+
+print("[diarize] Loading pyannote...", file=sys.stderr, flush=True)
+from pyannote.audio import Pipeline
+import torchaudio.functional as F
+
+# Read raw f32 samples from stdin (24kHz from stt-cli)
+print("[diarize] Reading audio from stdin...", file=sys.stderr, flush=True)
 audio_bytes = sys.stdin.buffer.read()
 num_samples = len(audio_bytes) // 4
+print(f"[diarize] Read {{num_samples}} samples ({{len(audio_bytes) / 1_000_000:.1f}} MB)", file=sys.stderr, flush=True)
+
 samples = struct.unpack(f'{{num_samples}}f', audio_bytes)
 
 # Convert to torch tensor: (1, num_samples) for mono
 waveform = torch.tensor(samples, dtype=torch.float32).unsqueeze(0)
+input_sample_rate = 24000
+duration_sec = num_samples / input_sample_rate
+print(f"[diarize] Audio duration: {{duration_sec:.1f}}s @ {{input_sample_rate}}Hz", file=sys.stderr, flush=True)
+
+# Resample to 16kHz (pyannote requirement)
+target_sample_rate = 16000
+if input_sample_rate != target_sample_rate:
+    print(f"[diarize] Resampling {{input_sample_rate}}Hz -> {{target_sample_rate}}Hz...", file=sys.stderr, flush=True)
+    waveform = F.resample(waveform, input_sample_rate, target_sample_rate)
 
 # Load pipeline
+print("[diarize] Loading pyannote pipeline (may download models on first run)...", file=sys.stderr, flush=True)
+start = time.time()
 pipeline = Pipeline.from_pretrained(
     "pyannote/speaker-diarization-3.1",
-    use_auth_token="{token}"
+    token="{token}"
 )
+print(f"[diarize] Pipeline loaded in {{time.time() - start:.1f}}s", file=sys.stderr, flush=True)
 
 # Run diarization with in-memory audio
-diarization = pipeline({{"waveform": waveform, "sample_rate": 24000}})
+print("[diarize] Running diarization...", file=sys.stderr, flush=True)
+start = time.time()
+diarization = pipeline({{"waveform": waveform, "sample_rate": target_sample_rate}})
+print(f"[diarize] Diarization completed in {{time.time() - start:.1f}}s", file=sys.stderr, flush=True)
 
 # Output as JSON lines: start, end, speaker
-for turn, _, speaker in diarization.itertracks(yield_label=True):
+segments = list(diarization.itertracks(yield_label=True))
+print(f"[diarize] Found {{len(segments)}} speaker segments", file=sys.stderr, flush=True)
+
+for turn, _, speaker in segments:
     print(json.dumps({{
         "start": turn.start,
         "end": turn.end,
@@ -1280,34 +1338,88 @@ for turn, _, speaker in diarization.itertracks(yield_label=True):
         .flat_map(|&s| s.to_le_bytes())
         .collect();
 
-    // Run Python with audio piped to stdin
+    // Write script to temp file (uv run needs a file for inline metadata)
+    let temp_dir = std::env::temp_dir();
+    let script_path = temp_dir.join("stt_diarize.py");
+    std::fs::write(&script_path, &python_script)?;
+
+    // Run with uv (handles dependencies automatically)
     use std::process::{Command, Stdio};
-    let mut child = Command::new("python3")
-        .arg("-c")
-        .arg(&python_script)
+    use std::io::{BufRead, BufReader};
+
+    let mut child = Command::new("uv")
+        .arg("run")
+        .arg(&script_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    // Write audio to stdin
-    if let Some(mut stdin) = child.stdin.take() {
+    // Write audio to stdin in a separate thread to avoid deadlock
+    let stdin = child.stdin.take().expect("Failed to open stdin");
+    let write_thread = std::thread::spawn(move || {
         use std::io::Write;
-        stdin.write_all(&audio_bytes)?;
+        let mut stdin = stdin;
+        if let Err(e) = stdin.write_all(&audio_bytes) {
+            eprintln!("Warning: Failed to write all audio data: {}", e);
+        }
+        // stdin is dropped here, closing the pipe
+    });
+
+    // Stream stderr in real-time (for progress logs)
+    let stderr = child.stderr.take().expect("Failed to open stderr");
+    let stderr_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        let mut all_lines = Vec::new();
+        let mut in_torchcodec_warning = false;
+
+        for line in reader.lines().map_while(Result::ok) {
+            all_lines.push(line.clone());
+
+            // Skip torchcodec warning block (it's noise - we use in-memory audio)
+            if line.contains("torchcodec is not installed") {
+                in_torchcodec_warning = true;
+                continue;
+            }
+            if in_torchcodec_warning {
+                if line.starts_with("[diarize]") {
+                    in_torchcodec_warning = false;
+                } else {
+                    continue;
+                }
+            }
+
+            // Print our progress markers
+            if line.starts_with("[diarize]") {
+                eprintln!("{}", line);
+            }
+        }
+        all_lines
+    });
+
+    // Read stdout (diarization results)
+    let stdout = child.stdout.take().expect("Failed to open stdout");
+    let stdout_reader = BufReader::new(stdout);
+    let stdout_lines: Vec<String> = stdout_reader.lines().map_while(Result::ok).collect();
+
+    // Wait for everything to complete
+    let status = child.wait()?;
+    let _ = write_thread.join();
+    let error_lines = stderr_thread.join().unwrap_or_default();
+
+    // Clean up temp script
+    let _ = std::fs::remove_file(&script_path);
+
+    if !status.success() {
+        // On failure, show full stderr
+        eprintln!("Full error output:\n{}", error_lines.join("\n"));
+        anyhow::bail!("Diarization failed (exit code: {:?})", status.code());
     }
 
-    let output = child.wait_with_output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Diarization failed:\n{}", stderr);
-    }
-
-    // Parse diarization results
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse diarization results from stdout
     let mut diarization_segments: Vec<(f64, f64, String)> = Vec::new();
 
-    for line in stdout.lines() {
+    for line in stdout_lines.iter() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             if let (Some(start), Some(end), Some(speaker)) = (
                 v["start"].as_f64(),
@@ -1319,7 +1431,7 @@ for turn, _, speaker in diarization.itertracks(yield_label=True):
         }
     }
 
-    eprintln!("Found {} speaker segments", diarization_segments.len());
+    eprintln!("[diarize] Updating JSONL with {} speaker segments", diarization_segments.len());
 
     // Read existing events
     let events_content = std::fs::read_to_string(&events_path)?;

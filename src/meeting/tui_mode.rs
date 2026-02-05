@@ -118,22 +118,16 @@ fn run_meeting_loop(
 ) -> Result<RecordedAudio> {
     let host = cpal::default_host();
 
-    // Find mic device
-    let mic = if let Some(name) = mic_device {
+    // Find mic device - use specified device or system default
+    let mic_dev = if let Some(name) = mic_device {
         host.input_devices()?
             .find(|d| d.name().map(|n| n.contains(name)).unwrap_or(false))
+            .ok_or_else(|| anyhow::anyhow!("Mic '{}' not found. Use --list-devices to see available.", name))?
     } else {
-        host.input_devices()?
-            .find(|d| {
-                d.name()
-                    .map(|n| n.contains("Microphone") || n.contains("Anker") || n.contains("Insta360"))
-                    .unwrap_or(false)
-            })
-            .or_else(|| host.default_input_device())
+        host.default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("No default input device. Use --mic to specify."))?
     };
-
-    let mic_dev = mic.ok_or_else(|| anyhow::anyhow!("No microphone found. Use --mic to specify."))?;
-    let _mic_name = mic_dev.name().unwrap_or_default();
+    eprintln!("Mic: {}", mic_dev.name().unwrap_or_else(|_| "Unknown".into()));
 
     // Get mic config
     let mic_config = mic_dev
@@ -475,32 +469,29 @@ fn run_transcription_loop(
             let mic_chunk: Vec<f32> = mic_buffer.drain(..chunk_size).collect();
             let sys_chunk: Vec<f32> = sys_buffer.drain(..chunk_size).collect();
 
-            match transcriber.process_batched_chunks(&[&mic_chunk, &sys_chunk]) {
-                Ok(results) => {
-                    let elapsed = start_time.elapsed();
-                    for (batch_idx, word) in results {
-                        if batch_idx < phrase_buffers.len() {
-                            // Flush other source if quiet
-                            let other_idx = 1 - batch_idx;
-                            if !phrase_buffers[other_idx].is_empty()
-                                && phrase_buffers[other_idx].quiet_for_ms() > 300
+            if let Ok(results) = transcriber.process_batched_chunks(&[&mic_chunk, &sys_chunk]) {
+                let elapsed = start_time.elapsed();
+                for (batch_idx, word) in results {
+                    if batch_idx < phrase_buffers.len() {
+                        // Flush other source if quiet
+                        let other_idx = 1 - batch_idx;
+                        if !phrase_buffers[other_idx].is_empty()
+                            && phrase_buffers[other_idx].quiet_for_ms() > 300
+                        {
+                            if let Some((start, end, text)) =
+                                phrase_buffers[other_idx].flush(elapsed)
                             {
-                                if let Some((start, end, text)) =
-                                    phrase_buffers[other_idx].flush(elapsed)
-                                {
-                                    let _ = event_tx.send(AppEvent::Transcript {
-                                        source: sources[other_idx],
-                                        text,
-                                        start_ms: start.as_millis() as u64,
-                                        end_ms: end.as_millis() as u64,
-                                    });
-                                }
+                                let _ = event_tx.send(AppEvent::Transcript {
+                                    source: sources[other_idx],
+                                    text,
+                                    start_ms: start.as_millis() as u64,
+                                    end_ms: end.as_millis() as u64,
+                                });
                             }
-                            phrase_buffers[batch_idx].add_word(word, elapsed);
                         }
+                        phrase_buffers[batch_idx].add_word(word, elapsed);
                     }
                 }
-                Err(_) => {}
             }
         }
 
