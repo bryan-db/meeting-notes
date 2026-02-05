@@ -115,8 +115,9 @@ stt listen --device "MacBook Pro Microphone"
 
 ```
 ~/Documents/meetings/MOTOR/
+├── CONTEXT.md        # (Optional) Meeting context from calendar agent
 ├── events.jsonl      # Transcript + events (source of truth)
-├── summary.md        # AI-generated meeting summary
+├── SUMMARY.md        # AI-generated meeting summary
 └── screenshots/
     ├── 001.png
     ├── 002.png
@@ -124,6 +125,8 @@ stt listen --device "MacBook Pro Microphone"
 ```
 
 **Note**: Audio is processed in memory and never saved to disk. This is intentional for privacy - only the text transcript is persisted.
+
+If a `CONTEXT.md` file exists in the session folder (e.g., created by a calendar agent with meeting details, attendees, agenda), it will be included in the summarization prompt for better context.
 
 ## JSONL Event Format
 

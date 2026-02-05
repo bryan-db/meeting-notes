@@ -1059,6 +1059,7 @@ for turn, _, speaker in diarization.itertracks(yield_label=True):
 
 fn generate_summary(session_dir: &PathBuf, anthropic_key: Option<&str>) -> Result<()> {
     let events_path = session_dir.join("events.jsonl");
+    let context_path = session_dir.join("CONTEXT.md");
 
     if !events_path.exists() {
         anyhow::bail!("Events file not found: {}", events_path.display());
@@ -1073,6 +1074,15 @@ fn generate_summary(session_dir: &PathBuf, anthropic_key: Option<&str>) -> Resul
             "Anthropic API key required for summary. Set --anthropic-key or ANTHROPIC_API_KEY env var."
         )
     })?;
+
+    // Read optional context file (from calendar agent)
+    let context = if context_path.exists() {
+        let content = std::fs::read_to_string(&context_path)?;
+        eprintln!("Using meeting context from CONTEXT.md");
+        Some(content)
+    } else {
+        None
+    };
 
     // Read events and build transcript
     let events_content = std::fs::read_to_string(&events_path)?;
@@ -1101,6 +1111,32 @@ fn generate_summary(session_dir: &PathBuf, anthropic_key: Option<&str>) -> Resul
 
     let transcript = transcript_lines.join("\n");
 
+    // Build prompt with optional context
+    let prompt = if let Some(ctx) = context {
+        format!(
+            "Please provide a comprehensive summary of this meeting transcript. Include:\n\
+            1. **Overview**: Brief description of the meeting purpose and participants\n\
+            2. **Key Discussion Points**: Main topics discussed\n\
+            3. **Decisions Made**: Any decisions that were reached\n\
+            4. **Action Items**: Tasks assigned or next steps identified\n\
+            5. **Notable Quotes**: Important statements worth highlighting\n\n\
+            Format the summary in Markdown.\n\n\
+            MEETING CONTEXT:\n{}\n\n\
+            TRANSCRIPT:\n{}", ctx, transcript
+        )
+    } else {
+        format!(
+            "Please provide a comprehensive summary of this meeting transcript. Include:\n\
+            1. **Overview**: Brief description of the meeting purpose and participants\n\
+            2. **Key Discussion Points**: Main topics discussed\n\
+            3. **Decisions Made**: Any decisions that were reached\n\
+            4. **Action Items**: Tasks assigned or next steps identified\n\
+            5. **Notable Quotes**: Important statements worth highlighting\n\n\
+            Format the summary in Markdown.\n\n\
+            TRANSCRIPT:\n{}", transcript
+        )
+    };
+
     // Call Claude API
     let request_body = serde_json::json!({
         "model": "claude-sonnet-4-20250514",
@@ -1108,16 +1144,7 @@ fn generate_summary(session_dir: &PathBuf, anthropic_key: Option<&str>) -> Resul
         "messages": [
             {
                 "role": "user",
-                "content": format!(
-                    "Please provide a comprehensive summary of this meeting transcript. Include:\n\
-                    1. **Overview**: Brief description of the meeting purpose and participants\n\
-                    2. **Key Discussion Points**: Main topics discussed\n\
-                    3. **Decisions Made**: Any decisions that were reached\n\
-                    4. **Action Items**: Tasks assigned or next steps identified\n\
-                    5. **Notable Quotes**: Important statements worth highlighting\n\n\
-                    Format the summary in Markdown.\n\n\
-                    TRANSCRIPT:\n{}", transcript
-                )
+                "content": prompt
             }
         ]
     });
@@ -1148,7 +1175,7 @@ fn generate_summary(session_dir: &PathBuf, anthropic_key: Option<&str>) -> Resul
         .unwrap_or("No summary generated");
 
     // Write summary
-    let summary_path = session_dir.join("summary.md");
+    let summary_path = session_dir.join("SUMMARY.md");
     std::fs::write(&summary_path, summary)?;
 
     eprintln!("✓ Summary written to: {}", summary_path.display());
