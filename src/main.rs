@@ -949,8 +949,8 @@ from pyannote.audio import Pipeline
 
 # Load pipeline
 pipeline = Pipeline.from_pretrained(
-    "pyannote/speaker-diarization-3.1",
-    use_auth_token="{token}"
+    "pyannote/speaker-diarization-community-1",
+    token="{token}"
 )
 
 # Run diarization
@@ -1256,13 +1256,14 @@ fn run_diarization_from_memory(
 
     // Python script that reads f32 samples from stdin
     // Uses uv run with inline script dependencies
-    let python_script = format!(
-        r#"# /// script
+    // Note: HF_TOKEN/HUGGINGFACE_TOKEN is passed via subprocess environment
+    let python_script = r#"# /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "torch>=2.0,<2.8",
+#     "torch",
 #     "torchaudio",
-#     "pyannote.audio>=3.3,<4.0",
+#     "pyannote.audio>=4.0",
+#     "huggingface_hub",
 # ]
 # ///
 
@@ -1270,16 +1271,15 @@ import json
 import sys
 import struct
 import time
+import os
 
 print("[diarize] Loading torch...", file=sys.stderr, flush=True)
 import torch
 
-# PyTorch 2.6+ changed weights_only default - allowlist required classes BEFORE importing pyannote
-if hasattr(torch.serialization, 'add_safe_globals'):
-    from omegaconf import ListConfig, DictConfig
-    torch.serialization.add_safe_globals([ListConfig, DictConfig])
-
 print("[diarize] Loading pyannote...", file=sys.stderr, flush=True)
+import pyannote.audio
+print(f"[diarize] pyannote.audio version: {pyannote.audio.__version__}", file=sys.stderr, flush=True)
+
 from pyannote.audio import Pipeline
 import torchaudio.functional as F
 
@@ -1287,50 +1287,45 @@ import torchaudio.functional as F
 print("[diarize] Reading audio from stdin...", file=sys.stderr, flush=True)
 audio_bytes = sys.stdin.buffer.read()
 num_samples = len(audio_bytes) // 4
-print(f"[diarize] Read {{num_samples}} samples ({{len(audio_bytes) / 1_000_000:.1f}} MB)", file=sys.stderr, flush=True)
+print(f"[diarize] Read {num_samples} samples ({len(audio_bytes) / 1_000_000:.1f} MB)", file=sys.stderr, flush=True)
 
-samples = struct.unpack(f'{{num_samples}}f', audio_bytes)
+samples = struct.unpack(f'{num_samples}f', audio_bytes)
 
 # Convert to torch tensor: (1, num_samples) for mono
 waveform = torch.tensor(samples, dtype=torch.float32).unsqueeze(0)
 input_sample_rate = 24000
 duration_sec = num_samples / input_sample_rate
-print(f"[diarize] Audio duration: {{duration_sec:.1f}}s @ {{input_sample_rate}}Hz", file=sys.stderr, flush=True)
+print(f"[diarize] Audio duration: {duration_sec:.1f}s @ {input_sample_rate}Hz", file=sys.stderr, flush=True)
 
 # Resample to 16kHz (pyannote requirement)
 target_sample_rate = 16000
 if input_sample_rate != target_sample_rate:
-    print(f"[diarize] Resampling {{input_sample_rate}}Hz -> {{target_sample_rate}}Hz...", file=sys.stderr, flush=True)
+    print(f"[diarize] Resampling {input_sample_rate}Hz -> {target_sample_rate}Hz...", file=sys.stderr, flush=True)
     waveform = F.resample(waveform, input_sample_rate, target_sample_rate)
 
-# Load pipeline
+# Load pipeline (uses HF_TOKEN or HUGGINGFACE_TOKEN env var for auth)
 print("[diarize] Loading pyannote pipeline (may download models on first run)...", file=sys.stderr, flush=True)
 start = time.time()
-pipeline = Pipeline.from_pretrained(
-    "pyannote/speaker-diarization-3.1",
-    token="{token}"
-)
-print(f"[diarize] Pipeline loaded in {{time.time() - start:.1f}}s", file=sys.stderr, flush=True)
+pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1")
+print(f"[diarize] Pipeline loaded in {time.time() - start:.1f}s", file=sys.stderr, flush=True)
 
 # Run diarization with in-memory audio
 print("[diarize] Running diarization...", file=sys.stderr, flush=True)
 start = time.time()
-diarization = pipeline({{"waveform": waveform, "sample_rate": target_sample_rate}})
-print(f"[diarize] Diarization completed in {{time.time() - start:.1f}}s", file=sys.stderr, flush=True)
+diarization = pipeline({"waveform": waveform, "sample_rate": target_sample_rate})
+print(f"[diarize] Diarization completed in {time.time() - start:.1f}s", file=sys.stderr, flush=True)
 
 # Output as JSON lines: start, end, speaker
 segments = list(diarization.itertracks(yield_label=True))
-print(f"[diarize] Found {{len(segments)}} speaker segments", file=sys.stderr, flush=True)
+print(f"[diarize] Found {len(segments)} speaker segments", file=sys.stderr, flush=True)
 
 for turn, _, speaker in segments:
-    print(json.dumps({{
+    print(json.dumps({
         "start": turn.start,
         "end": turn.end,
         "speaker": speaker
-    }}))
-"#,
-        token = token
-    );
+    }))
+"#;
 
     // Convert f32 samples to bytes for piping
     let audio_bytes: Vec<u8> = sys_samples
@@ -1339,17 +1334,21 @@ for turn, _, speaker in segments:
         .collect();
 
     // Write script to temp file (uv run needs a file for inline metadata)
+    // Use unique name to avoid stale cache
     let temp_dir = std::env::temp_dir();
-    let script_path = temp_dir.join("stt_diarize.py");
-    std::fs::write(&script_path, &python_script)?;
+    let script_path = temp_dir.join("stt_diarize_v4.py");
+    std::fs::write(&script_path, python_script)?;
 
     // Run with uv (handles dependencies automatically)
+    // Pass HF token via environment variable for pyannote authentication
     use std::process::{Command, Stdio};
     use std::io::{BufRead, BufReader};
 
     let mut child = Command::new("uv")
         .arg("run")
         .arg(&script_path)
+        .env("HUGGINGFACE_TOKEN", &token)
+        .env("HF_TOKEN", &token) // pyannote also checks HF_TOKEN
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
