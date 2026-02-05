@@ -28,6 +28,9 @@ ratatui = "0.29"
 crossterm = "0.28"
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
+pyannote-rs = "0.3"
+eyre = "0.6"
+ort = { version = "=2.0.0-rc.10", features = ["ndarray"] }
 
 [features]
 default = ["metal"]

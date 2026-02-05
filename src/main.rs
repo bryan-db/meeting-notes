@@ -1174,36 +1174,13 @@ fn generate_summary(session_dir: &Path, anthropic_key: Option<&str>) -> Result<(
     Ok(())
 }
 
-/// Run diarization from in-memory audio samples (no files written to disk)
+/// Run diarization from in-memory audio samples using pyannote-rs (pure Rust, no Python)
 fn run_diarization_from_memory(
     session_dir: &Path,
     sys_samples: &[f32],
-    hf_token: Option<&str>,
+    _hf_token: Option<&str>, // No longer needed - using open ONNX models
 ) -> Result<()> {
-    // Check for required binaries
-    if std::process::Command::new("uv")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_err()
-    {
-        anyhow::bail!(
-            "uv not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
-        );
-    }
-
-    if std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_err()
-    {
-        anyhow::bail!(
-            "ffmpeg not found. Install with: brew install ffmpeg"
-        );
-    }
+    use pyannote_rs::{EmbeddingExtractor, EmbeddingManager};
 
     let events_path = session_dir.join("events.jsonl");
 
@@ -1216,36 +1193,38 @@ fn run_diarization_from_memory(
         return Ok(());
     }
 
-    // Get HF token from arg, env, or prompt
-    let token = hf_token
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("HUGGINGFACE_TOKEN").ok())
-        .or_else(|| std::env::var("HF_TOKEN").ok())
-        .or_else(|| {
-            // Prompt user for token
-            eprintln!("HuggingFace token required for speaker diarization.");
-            eprintln!("Get token at: https://huggingface.co/settings/tokens");
-            eprintln!("Accept terms at: https://huggingface.co/pyannote/speaker-diarization-3.1");
-            eprint!("\nEnter HF token (or press Enter to skip): ");
-            io::stderr().flush().ok();
+    // Find model files - check multiple locations
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
-            let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_ok() {
-                let trimmed = input.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-            None
-        });
+    let model_dirs = [
+        Some(PathBuf::from("models")),
+        exe_dir.as_ref().map(|d| d.join("models")),
+        dirs::data_dir().map(|d| d.join("stt-cli").join("models")),
+    ];
 
-    let token = match token {
-        Some(t) => t,
-        None => {
-            eprintln!("Skipping diarization (no token provided)");
-            return Ok(());
-        }
-    };
+    let segmentation_model = model_dirs
+        .iter()
+        .flatten()
+        .map(|d| d.join("segmentation-3.0.onnx"))
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow::anyhow!(
+            "segmentation-3.0.onnx not found. Download from:\n\
+             https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/segmentation-3.0.onnx\n\
+             Place in ./models/ directory"
+        ))?;
+
+    let embedding_model = model_dirs
+        .iter()
+        .flatten()
+        .map(|d| d.join("wespeaker_en_voxceleb_CAM++.onnx"))
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow::anyhow!(
+            "wespeaker_en_voxceleb_CAM++.onnx not found. Download from:\n\
+             https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/wespeaker_en_voxceleb_CAM++.onnx\n\
+             Place in ./models/ directory"
+        ))?;
 
     let duration_secs = sys_samples.len() as f64 / 24000.0;
     eprintln!(
@@ -1254,185 +1233,57 @@ fn run_diarization_from_memory(
         (sys_samples.len() * 4) as f64 / 1_000_000.0
     );
 
-    // Python script that reads f32 samples from stdin
-    // Uses uv run with inline script dependencies
-    // Note: HF_TOKEN/HUGGINGFACE_TOKEN is passed via subprocess environment
-    let python_script = r#"# /// script
-# requires-python = ">=3.10"
-# dependencies = [
-#     "torch",
-#     "torchaudio",
-#     "pyannote.audio>=4.0",
-#     "huggingface_hub",
-# ]
-# ///
+    // Convert f32 samples to i16 (pyannote-rs expects i16)
+    // Also resample from 24kHz to 16kHz (pyannote requirement)
+    eprintln!("[diarize] Resampling 24kHz -> 16kHz and converting to i16...");
+    let resampler = SimpleResampler::new(24000, 16000);
+    let resampled: Vec<f32> = {
+        let mut rs = resampler;
+        rs.process(sys_samples)
+    };
 
-import json
-import sys
-import struct
-import time
-import os
-
-print("[diarize] Loading torch...", file=sys.stderr, flush=True)
-import torch
-
-print("[diarize] Loading pyannote...", file=sys.stderr, flush=True)
-import pyannote.audio
-print(f"[diarize] pyannote.audio version: {pyannote.audio.__version__}", file=sys.stderr, flush=True)
-
-from pyannote.audio import Pipeline
-import torchaudio.functional as F
-
-# Read raw f32 samples from stdin (24kHz from stt-cli)
-print("[diarize] Reading audio from stdin...", file=sys.stderr, flush=True)
-audio_bytes = sys.stdin.buffer.read()
-num_samples = len(audio_bytes) // 4
-print(f"[diarize] Read {num_samples} samples ({len(audio_bytes) / 1_000_000:.1f} MB)", file=sys.stderr, flush=True)
-
-samples = struct.unpack(f'{num_samples}f', audio_bytes)
-
-# Convert to torch tensor: (1, num_samples) for mono
-waveform = torch.tensor(samples, dtype=torch.float32).unsqueeze(0)
-input_sample_rate = 24000
-duration_sec = num_samples / input_sample_rate
-print(f"[diarize] Audio duration: {duration_sec:.1f}s @ {input_sample_rate}Hz", file=sys.stderr, flush=True)
-
-# Resample to 16kHz (pyannote requirement)
-target_sample_rate = 16000
-if input_sample_rate != target_sample_rate:
-    print(f"[diarize] Resampling {input_sample_rate}Hz -> {target_sample_rate}Hz...", file=sys.stderr, flush=True)
-    waveform = F.resample(waveform, input_sample_rate, target_sample_rate)
-
-# Load pipeline (uses HF_TOKEN or HUGGINGFACE_TOKEN env var for auth)
-print("[diarize] Loading pyannote pipeline (may download models on first run)...", file=sys.stderr, flush=True)
-start = time.time()
-pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1")
-print(f"[diarize] Pipeline loaded in {time.time() - start:.1f}s", file=sys.stderr, flush=True)
-
-# Run diarization with in-memory audio
-print("[diarize] Running diarization...", file=sys.stderr, flush=True)
-start = time.time()
-diarization = pipeline({"waveform": waveform, "sample_rate": target_sample_rate})
-print(f"[diarize] Diarization completed in {time.time() - start:.1f}s", file=sys.stderr, flush=True)
-
-# Output as JSON lines: start, end, speaker
-segments = list(diarization.itertracks(yield_label=True))
-print(f"[diarize] Found {len(segments)} speaker segments", file=sys.stderr, flush=True)
-
-for turn, _, speaker in segments:
-    print(json.dumps({
-        "start": turn.start,
-        "end": turn.end,
-        "speaker": speaker
-    }))
-"#;
-
-    // Convert f32 samples to bytes for piping
-    let audio_bytes: Vec<u8> = sys_samples
+    let samples_i16: Vec<i16> = resampled
         .iter()
-        .flat_map(|&s| s.to_le_bytes())
+        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
         .collect();
 
-    // Write script to temp file (uv run needs a file for inline metadata)
-    // Use unique name to avoid stale cache
-    let temp_dir = std::env::temp_dir();
-    let script_path = temp_dir.join("stt_diarize_v4.py");
-    std::fs::write(&script_path, python_script)?;
+    eprintln!("[diarize] Loading segmentation model...");
+    let segments = pyannote_rs::get_segments(&samples_i16, 16000, &segmentation_model)
+        .map_err(|e| anyhow::anyhow!("Segmentation failed: {:?}", e))?;
 
-    // Run with uv (handles dependencies automatically)
-    // Pass HF token via environment variable for pyannote authentication
-    use std::process::{Command, Stdio};
-    use std::io::{BufRead, BufReader};
+    eprintln!("[diarize] Loading speaker embedding model...");
+    let mut extractor = EmbeddingExtractor::new(&embedding_model)
+        .map_err(|e| anyhow::anyhow!("Failed to load embedding model: {:?}", e))?;
 
-    let mut child = Command::new("uv")
-        .arg("run")
-        .arg(&script_path)
-        .env("HUGGINGFACE_TOKEN", &token)
-        .env("HF_TOKEN", &token) // pyannote also checks HF_TOKEN
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut manager = EmbeddingManager::new(10); // Support up to 10 speakers
+    let similarity_threshold = 0.5;
 
-    // Write audio to stdin in a separate thread to avoid deadlock
-    let stdin = child.stdin.take().expect("Failed to open stdin");
-    let write_thread = std::thread::spawn(move || {
-        use std::io::Write;
-        let mut stdin = stdin;
-        if let Err(e) = stdin.write_all(&audio_bytes) {
-            eprintln!("Warning: Failed to write all audio data: {}", e);
-        }
-        // stdin is dropped here, closing the pipe
-    });
-
-    // Stream stderr in real-time (for progress logs)
-    let stderr = child.stderr.take().expect("Failed to open stderr");
-    let stderr_thread = std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        let mut all_lines = Vec::new();
-        let mut in_torchcodec_warning = false;
-
-        for line in reader.lines().map_while(Result::ok) {
-            all_lines.push(line.clone());
-
-            // Skip torchcodec warning block (it's noise - we use in-memory audio)
-            if line.contains("torchcodec is not installed") {
-                in_torchcodec_warning = true;
-                continue;
-            }
-            if in_torchcodec_warning {
-                if line.starts_with("[diarize]") {
-                    in_torchcodec_warning = false;
-                } else {
-                    continue;
-                }
-            }
-
-            // Print our progress markers
-            if line.starts_with("[diarize]") {
-                eprintln!("{}", line);
-            }
-        }
-        all_lines
-    });
-
-    // Read stdout (diarization results)
-    let stdout = child.stdout.take().expect("Failed to open stdout");
-    let stdout_reader = BufReader::new(stdout);
-    let stdout_lines: Vec<String> = stdout_reader.lines().map_while(Result::ok).collect();
-
-    // Wait for everything to complete
-    let status = child.wait()?;
-    let _ = write_thread.join();
-    let error_lines = stderr_thread.join().unwrap_or_default();
-
-    // Clean up temp script
-    let _ = std::fs::remove_file(&script_path);
-
-    if !status.success() {
-        // On failure, show full stderr
-        eprintln!("Full error output:\n{}", error_lines.join("\n"));
-        anyhow::bail!("Diarization failed (exit code: {:?})", status.code());
-    }
-
-    // Parse diarization results from stdout
+    eprintln!("[diarize] Processing segments...");
     let mut diarization_segments: Vec<(f64, f64, String)> = Vec::new();
 
-    for line in stdout_lines.iter() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let (Some(start), Some(end), Some(speaker)) = (
-                v["start"].as_f64(),
-                v["end"].as_f64(),
-                v["speaker"].as_str(),
-            ) {
-                diarization_segments.push((start, end, speaker.to_string()));
+    for segment_result in segments {
+        match segment_result {
+            Ok(segment) => {
+                let speaker = if let Ok(embedding) = extractor.compute(&segment.samples) {
+                    manager
+                        .search_speaker(embedding.collect(), similarity_threshold)
+                        .map(|s| format!("SPEAKER_{:02}", s))
+                        .unwrap_or_else(|| "SPEAKER_00".to_string())
+                } else {
+                    "UNKNOWN".to_string()
+                };
+
+                diarization_segments.push((segment.start, segment.end, speaker));
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to process segment: {:?}", e);
             }
         }
     }
 
-    eprintln!("[diarize] Updating JSONL with {} speaker segments", diarization_segments.len());
+    eprintln!("[diarize] Found {} speaker segments", diarization_segments.len());
 
-    // Read existing events
+    // Read existing events and update with speaker labels
     let events_content = std::fs::read_to_string(&events_path)?;
     let mut updated_events = Vec::new();
 

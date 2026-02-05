@@ -8,7 +8,7 @@ Real-time speech-to-text CLI with meeting transcription, speaker diarization, an
 - **Dual-source meeting mode** - captures your voice (mic) + remote participants (system audio) simultaneously
 - **Interactive TUI** with live transcript, markers, and notes
 - **Screenshot capture** - press `s` to capture screen regions, or drag-and-drop images
-- **Speaker diarization** - automatically identifies different speakers using pyannote
+- **Speaker diarization** - automatically identifies different speakers (pure Rust, no Python)
 - **AI summaries** - generates meeting summaries using Claude API
 - **JSONL event log** - structured output for LLM consumption (`tail -f events.jsonl | jq`)
 - **Privacy-focused** - audio is processed in memory only, never written to disk
@@ -19,7 +19,6 @@ Real-time speech-to-text CLI with meeting transcription, speaker diarization, an
 
 - macOS (Metal GPU acceleration)
 - Rust toolchain
-- Python 3 with pyannote.audio (for diarization)
 
 ### Build
 
@@ -27,14 +26,14 @@ Real-time speech-to-text CLI with meeting transcription, speaker diarization, an
 cargo build --release
 ```
 
-### Diarization Setup
+### Diarization Models
+
+Speaker diarization uses ONNX models (no Python needed). Download to `models/`:
 
 ```bash
-pip install pyannote.audio torch
-
-# Set HuggingFace token (get from https://huggingface.co/settings/tokens)
-# Must accept terms at: https://huggingface.co/pyannote/speaker-diarization-3.1
-export HUGGINGFACE_TOKEN=hf_xxxxx
+mkdir -p models && cd models
+curl -LO https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/segmentation-3.0.onnx
+curl -LO https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/wespeaker_en_voxceleb_CAM++.onnx
 ```
 
 ### Summary Setup (Optional)
@@ -168,7 +167,6 @@ For system audio capture, the app uses macOS ScreenCaptureKit which requires Scr
 --no-tui           Disable TUI, use plain text output
 --no-diarize       Skip automatic speaker diarization
 --no-summary       Skip AI summary generation
---hf-token <TOKEN> HuggingFace token for pyannote (or set HUGGINGFACE_TOKEN env)
 --anthropic-key    Anthropic API key for summaries (or set ANTHROPIC_API_KEY env)
 ```
 
@@ -176,7 +174,7 @@ For system audio capture, the app uses macOS ScreenCaptureKit which requires Scr
 
 Audio is kept in memory during the meeting for real-time transcription and speaker diarization. When the meeting ends:
 
-1. Audio is piped directly to pyannote for speaker identification
+1. Audio is processed with local ONNX models for speaker identification (no network calls)
 2. Speaker labels are added to the transcript
 3. Audio buffers are dropped (freed from memory)
 4. **No audio files are ever written to disk**
