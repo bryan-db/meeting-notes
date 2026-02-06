@@ -1,13 +1,12 @@
 // Integrated TUI meeting mode with JSONL logging
+// Uses Whisper for periodic transcription
 
-use crate::app_event::AppEvent;
 use crate::events::{AudioSource, Event};
 use crate::jsonl_writer::JsonlWriter;
-use crate::meeting::PhraseBuffer;
 use crate::tui::{draw, handle_key, App, KeyAction};
+use crate::WhisperTranscriber;
 
 use anyhow::Result;
-use candle_core::Device;
 use chrono::Utc;
 use crossterm::{
     event::{self, Event as CrosstermEvent, KeyEventKind},
@@ -16,12 +15,25 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::process::Command;
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use screencapturekit::{
+    cm::CMSampleBuffer,
+    shareable_content::SCShareableContent,
+    stream::{
+        configuration::SCStreamConfiguration,
+        content_filter::SCContentFilter,
+        output_trait::SCStreamOutputTrait,
+        output_type::SCStreamOutputType,
+        sc_stream::SCStream,
+    },
+};
 
 /// Audio data collected during transcription (kept in memory, never written to disk)
 #[derive(Debug, Default)]
@@ -31,10 +43,10 @@ pub struct RecordedAudio {
 }
 
 impl RecordedAudio {
-    /// Duration in seconds based on 24kHz sample rate
+    /// Duration in seconds based on 16kHz sample rate
     pub fn duration_secs(&self) -> f64 {
         let max_samples = self.mic_samples.len().max(self.sys_samples.len());
-        max_samples as f64 / 24000.0
+        max_samples as f64 / 16000.0
     }
 
     /// Memory usage in bytes
@@ -53,25 +65,91 @@ impl Drop for TerminalGuard {
     }
 }
 
-// Re-use types from main
-use crate::{SimpleResampler, SystemAudioHandler, Transcriber, ctrlc_handler, to_mono};
+/// ScreenCaptureKit audio handler
+pub struct SystemAudioHandler {
+    pub tx: mpsc::Sender<Vec<f32>>,
+}
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use screencapturekit::{
-    shareable_content::SCShareableContent,
-    stream::{
-        configuration::SCStreamConfiguration,
-        content_filter::SCContentFilter,
-        output_type::SCStreamOutputType,
-        sc_stream::SCStream,
-    },
-};
+impl SCStreamOutputTrait for SystemAudioHandler {
+    fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, of_type: SCStreamOutputType) {
+        if of_type == SCStreamOutputType::Audio {
+            if let Some(audio_list) = sample_buffer.audio_buffer_list() {
+                let mut idx = 0;
+                while let Some(buffer) = audio_list.buffer(idx) {
+                    let data = buffer.data();
+                    if !data.is_empty() {
+                        let samples: Vec<f32> = data
+                            .chunks_exact(4)
+                            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                            .collect();
+                        let _ = self.tx.send(samples);
+                    }
+                    idx += 1;
+                }
+            }
+        }
+    }
+}
 
-/// Run meeting mode with TUI
+/// Simple linear resampler
+pub struct SimpleResampler {
+    ratio: f64,
+}
+
+impl SimpleResampler {
+    pub fn new(source_rate: u32, target_rate: u32) -> Self {
+        Self {
+            ratio: source_rate as f64 / target_rate as f64,
+        }
+    }
+
+    pub fn process(&self, samples: &[f32]) -> Vec<f32> {
+        let output_len = (samples.len() as f64 / self.ratio).ceil() as usize;
+        let mut output = Vec::with_capacity(output_len);
+
+        for i in 0..output_len {
+            let src_idx = i as f64 * self.ratio;
+            let src_floor = src_idx.floor() as usize;
+            let src_ceil = (src_floor + 1).min(samples.len() - 1);
+            let frac = src_idx - src_floor as f64;
+
+            let sample = if src_floor < samples.len() {
+                let s1 = samples[src_floor];
+                let s2 = samples[src_ceil];
+                s1 + (s2 - s1) * frac as f32
+            } else {
+                0.0
+            };
+            output.push(sample);
+        }
+        output
+    }
+}
+
+fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+    if channels == 1 {
+        samples.to_vec()
+    } else {
+        samples
+            .chunks(channels)
+            .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
+            .collect()
+    }
+}
+
+pub fn ctrlc_handler(running: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGINT])
+            .expect("Failed to create signal handler");
+        if signals.forever().next().is_some() {
+            running.store(false, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Run meeting mode with TUI using sherpa-rs Whisper
 /// Returns RecordedAudio containing mic and system audio samples (in memory)
-pub fn run_tui_meeting(
-    model_repo: &str,
-    device: &Device,
+pub fn run_tui_meeting_sherpa(
     mic_device: Option<&str>,
     session_folder: &Path,
 ) -> Result<RecordedAudio> {
@@ -84,7 +162,7 @@ pub fn run_tui_meeting(
 
     // Initialize terminal
     enable_raw_mode()?;
-    let _guard = TerminalGuard; // Ensures cleanup even on panic
+    let _guard = TerminalGuard;
 
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -92,42 +170,35 @@ pub fn run_tui_meeting(
     let mut terminal = Terminal::new(backend)?;
 
     // Run the main loop
-    let recorded_audio = run_meeting_loop(
+    let recorded_audio = run_meeting_loop_sherpa(
         &mut terminal,
-        model_repo,
-        device,
         mic_device,
         &events_path,
         &screenshots_dir,
     )?;
 
-    // Restore terminal (guard will also run on drop, but explicit cleanup is cleaner)
     terminal.show_cursor()?;
-    // Guard handles disable_raw_mode and LeaveAlternateScreen on drop
 
     Ok(recorded_audio)
 }
 
-fn run_meeting_loop(
+fn run_meeting_loop_sherpa(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    model_repo: &str,
-    device: &Device,
     mic_device: Option<&str>,
     events_path: &Path,
     screenshots_dir: &Path,
 ) -> Result<RecordedAudio> {
     let host = cpal::default_host();
 
-    // Find mic device - use specified device or system default
+    // Find mic device
     let mic_dev = if let Some(name) = mic_device {
         host.input_devices()?
             .find(|d| d.name().map(|n| n.contains(name)).unwrap_or(false))
-            .ok_or_else(|| anyhow::anyhow!("Mic '{}' not found. Use --list-devices to see available.", name))?
+            .ok_or_else(|| anyhow::anyhow!("Mic '{}' not found", name))?
     } else {
         host.default_input_device()
-            .ok_or_else(|| anyhow::anyhow!("No default input device. Use --mic to specify."))?
+            .ok_or_else(|| anyhow::anyhow!("No default input device"))?
     };
-    eprintln!("Mic: {}", mic_dev.name().unwrap_or_else(|_| "Unknown".into()));
 
     // Get mic config
     let mic_config = mic_dev
@@ -139,18 +210,16 @@ fn run_meeting_loop(
     let mic_rate = mic_config.sample_rate().0;
     let mic_channels = mic_config.channels() as usize;
     let sys_rate = 48000u32;
+    let target_rate = 16000u32; // Whisper expects 16kHz
 
     // Initialize JSONL writer
     let mut writer = JsonlWriter::new(events_path)?;
 
-    // Screenshot counter
-    let mut screenshot_count: u32 = 0;
     let screenshots_dir = screenshots_dir.to_path_buf();
+    let mut screenshot_count: u32 = 0;
 
-    // Generate session ID
     let session_id = format!("mtg_{}", Utc::now().format("%Y%m%d_%H%M%S"));
 
-    // Initialize TUI app
     let mut app = App::new();
 
     // Write session start
@@ -162,15 +231,12 @@ fn run_meeting_loop(
     writer.write(&start_event)?;
     app.add_event(start_event);
 
-    // Load transcriber
-    let mut transcriber = Transcriber::load_batched(model_repo, device, 2)?;
-
     // Audio channels
     let (mic_tx, mic_rx) = mpsc::channel::<Vec<f32>>();
     let (sys_tx, sys_rx) = mpsc::channel::<Vec<f32>>();
 
-    // App event channel (for transcripts and key events)
-    let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
+    // Transcript channel
+    let (transcript_tx, transcript_rx) = mpsc::channel::<(AudioSource, String, u64, u64)>();
 
     let running = Arc::new(AtomicBool::new(true));
     ctrlc_handler(running.clone());
@@ -215,17 +281,16 @@ fn run_meeting_loop(
     )?;
     mic_stream.play()?;
 
-    // Spawn transcription thread
+    // Spawn audio collection and transcription thread
     let running_clone = running.clone();
-    let event_tx_clone = event_tx.clone();
     let transcription_handle = std::thread::spawn(move || {
-        run_transcription_loop(
-            &mut transcriber,
+        run_audio_collection(
             mic_rx,
             sys_rx,
             mic_rate,
             sys_rate,
-            event_tx_clone,
+            target_rate,
+            transcript_tx,
             running_clone,
         )
     });
@@ -235,10 +300,8 @@ fn run_meeting_loop(
     let mut last_tick = Instant::now();
 
     while running.load(Ordering::SeqCst) && !app.should_quit {
-        // Draw UI
         terminal.draw(|f| draw(f, &app))?;
 
-        // Poll for crossterm events
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
             if let CrosstermEvent::Key(key) = event::read()? {
@@ -269,7 +332,6 @@ fn run_meeting_loop(
                             app.add_event(event);
                         }
                         KeyAction::CaptureScreenshot => {
-                            // Temporarily leave raw mode for screencapture
                             disable_raw_mode()?;
                             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
@@ -278,11 +340,10 @@ fn run_meeting_loop(
                             let filepath = screenshots_dir.join(&filename);
 
                             let status = Command::new("screencapture")
-                                .arg("-i") // Interactive selection
+                                .arg("-i")
                                 .arg(&filepath)
                                 .status();
 
-                            // Restore terminal
                             enable_raw_mode()?;
                             execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                             terminal.clear()?;
@@ -299,7 +360,6 @@ fn run_meeting_loop(
                             }
                         }
                         KeyAction::CaptureWindowScreenshot => {
-                            // Temporarily leave raw mode for screencapture
                             disable_raw_mode()?;
                             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
@@ -308,11 +368,10 @@ fn run_meeting_loop(
                             let filepath = screenshots_dir.join(&filename);
 
                             let status = Command::new("screencapture")
-                                .arg("-W") // Window selection
+                                .arg("-W")
                                 .arg(&filepath)
                                 .status();
 
-                            // Restore terminal
                             enable_raw_mode()?;
                             execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                             terminal.clear()?;
@@ -357,32 +416,19 @@ fn run_meeting_loop(
         }
 
         // Process transcription events
-        while let Ok(app_event) = event_rx.try_recv() {
-            match app_event {
-                AppEvent::Transcript {
-                    source,
-                    text,
-                    start_ms,
-                    end_ms,
-                } => {
-                    let event = Event::Segment {
-                        id: writer.next_id(),
-                        ts: Utc::now(),
-                        src: source,
-                        text,
-                        start_ms,
-                        end_ms,
-                    };
-                    writer.write(&event)?;
-                    app.add_event(event);
-                }
-                AppEvent::Quit => {
-                    running.store(false, Ordering::SeqCst);
-                }
-            }
+        while let Ok((source, text, start_ms, end_ms)) = transcript_rx.try_recv() {
+            let event = Event::Segment {
+                id: writer.next_id(),
+                ts: Utc::now(),
+                src: source,
+                text,
+                start_ms,
+                end_ms,
+            };
+            writer.write(&event)?;
+            app.add_event(event);
         }
 
-        // Tick
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
         }
@@ -392,10 +438,9 @@ fn run_meeting_loop(
     running.store(false, Ordering::SeqCst);
     sc_stream.stop_capture().ok();
 
-    // Wait for transcription thread and get recorded audio
     let recorded_audio = transcription_handle
         .join()
-        .map_err(|_| anyhow::anyhow!("Transcription thread panicked"))?;
+        .map_err(|_| anyhow::anyhow!("Audio thread panicked"))?;
 
     // Write session end
     let end_event = Event::SessionEnd {
@@ -405,124 +450,129 @@ fn run_meeting_loop(
     };
     writer.write(&end_event)?;
 
-    // Return recorded audio (kept in memory for diarization, never written to disk)
     Ok(recorded_audio)
 }
 
-fn run_transcription_loop(
-    transcriber: &mut Transcriber,
+/// Collect audio and run periodic transcription
+fn run_audio_collection(
     mic_rx: mpsc::Receiver<Vec<f32>>,
     sys_rx: mpsc::Receiver<Vec<f32>>,
     mic_rate: u32,
     sys_rate: u32,
-    event_tx: mpsc::Sender<AppEvent>,
+    target_rate: u32,
+    transcript_tx: mpsc::Sender<(AudioSource, String, u64, u64)>,
     running: Arc<AtomicBool>,
 ) -> RecordedAudio {
-    let mut mic_resampler = if mic_rate != 24000 {
-        Some(SimpleResampler::new(mic_rate, 24000))
-    } else {
-        None
-    };
-    let mut sys_resampler = if sys_rate != 24000 {
-        Some(SimpleResampler::new(sys_rate, 24000))
-    } else {
-        None
-    };
+    let mic_resampler = SimpleResampler::new(mic_rate, target_rate);
+    let sys_resampler = SimpleResampler::new(sys_rate, target_rate);
 
-    let mut mic_buffer = Vec::new();
-    let mut sys_buffer = Vec::new();
-    let chunk_size = 1920;
-    let start_time = Instant::now();
-
-    // Accumulate all audio for saving
     let mut all_mic_samples = Vec::new();
     let mut all_sys_samples = Vec::new();
 
-    let sources = [AudioSource::Mic, AudioSource::Sys];
-    let mut phrase_buffers = [PhraseBuffer::new(), PhraseBuffer::new()];
-    let pause_threshold_ms = 800;
+    // Buffers for periodic transcription
+    let mut mic_transcribe_buffer = Vec::new();
+    let mut sys_transcribe_buffer = Vec::new();
+
+    let start_time = Instant::now();
+    let mut last_transcribe = Instant::now();
+    let transcribe_interval = Duration::from_secs(5); // Transcribe every 5 seconds
+    let min_samples = target_rate as usize * 2; // Minimum 2 seconds of audio
+
+    // Try to load Whisper (optional - may fail if models not found)
+    let models_dir = find_models_dir_internal();
+    let mut transcriber: Option<WhisperTranscriber> = models_dir
+        .as_ref()
+        .and_then(|dir| {
+            WhisperTranscriber::new(&dir.join("sherpa-onnx-whisper-turbo")).ok()
+        });
+
+    if transcriber.is_none() {
+        eprintln!("Note: Whisper models not found, recording audio only");
+    }
 
     while running.load(Ordering::SeqCst) {
-        // Collect audio
+        // Collect mic audio
         while let Ok(samples) = mic_rx.try_recv() {
-            let resampled = if let Some(ref mut rs) = mic_resampler {
-                rs.process(&samples)
-            } else {
-                samples
-            };
-            mic_buffer.extend(resampled.iter().copied());
-            all_mic_samples.extend(resampled);
+            let resampled = mic_resampler.process(&samples);
+            all_mic_samples.extend(resampled.iter().copied());
+            mic_transcribe_buffer.extend(resampled);
         }
 
+        // Collect system audio
         while let Ok(samples) = sys_rx.try_recv() {
-            let resampled = if let Some(ref mut rs) = sys_resampler {
-                rs.process(&samples)
-            } else {
-                samples
-            };
-            sys_buffer.extend(resampled.iter().copied());
-            all_sys_samples.extend(resampled);
+            let resampled = sys_resampler.process(&samples);
+            all_sys_samples.extend(resampled.iter().copied());
+            sys_transcribe_buffer.extend(resampled);
         }
 
-        // Process chunks
-        while mic_buffer.len() >= chunk_size && sys_buffer.len() >= chunk_size {
-            let mic_chunk: Vec<f32> = mic_buffer.drain(..chunk_size).collect();
-            let sys_chunk: Vec<f32> = sys_buffer.drain(..chunk_size).collect();
+        // Periodic transcription
+        if last_transcribe.elapsed() >= transcribe_interval {
+            if let Some(ref mut whisper) = transcriber {
+                let elapsed_ms = start_time.elapsed().as_millis() as u64;
 
-            if let Ok(results) = transcriber.process_batched_chunks(&[&mic_chunk, &sys_chunk]) {
-                let elapsed = start_time.elapsed();
-                for (batch_idx, word) in results {
-                    if batch_idx < phrase_buffers.len() {
-                        // Flush other source if quiet
-                        let other_idx = 1 - batch_idx;
-                        if !phrase_buffers[other_idx].is_empty()
-                            && phrase_buffers[other_idx].quiet_for_ms() > 300
-                        {
-                            if let Some((start, end, text)) =
-                                phrase_buffers[other_idx].flush(elapsed)
-                            {
-                                let _ = event_tx.send(AppEvent::Transcript {
-                                    source: sources[other_idx],
-                                    text,
-                                    start_ms: start.as_millis() as u64,
-                                    end_ms: end.as_millis() as u64,
-                                });
-                            }
+                // Transcribe mic buffer
+                if mic_transcribe_buffer.len() >= min_samples {
+                    let start_ms = elapsed_ms.saturating_sub(
+                        (mic_transcribe_buffer.len() as u64 * 1000) / target_rate as u64
+                    );
+
+                    if let Ok(result) = whisper.transcribe(&mic_transcribe_buffer, target_rate) {
+                        let text = result.text.trim().to_string();
+                        if !text.is_empty() {
+                            let _ = transcript_tx.send((AudioSource::Mic, text, start_ms, elapsed_ms));
                         }
-                        phrase_buffers[batch_idx].add_word(word, elapsed);
                     }
+                    mic_transcribe_buffer.clear();
                 }
-            }
-        }
 
-        // Flush paused phrases
-        let elapsed = start_time.elapsed();
-        for (idx, buffer) in phrase_buffers.iter_mut().enumerate() {
-            if buffer.should_flush(pause_threshold_ms) {
-                if let Some((start, end, text)) = buffer.flush(elapsed) {
-                    let _ = event_tx.send(AppEvent::Transcript {
-                        source: sources[idx],
-                        text,
-                        start_ms: start.as_millis() as u64,
-                        end_ms: end.as_millis() as u64,
-                    });
+                // Transcribe system buffer
+                if sys_transcribe_buffer.len() >= min_samples {
+                    let start_ms = elapsed_ms.saturating_sub(
+                        (sys_transcribe_buffer.len() as u64 * 1000) / target_rate as u64
+                    );
+
+                    if let Ok(result) = whisper.transcribe(&sys_transcribe_buffer, target_rate) {
+                        let text = result.text.trim().to_string();
+                        if !text.is_empty() {
+                            let _ = transcript_tx.send((AudioSource::Sys, text, start_ms, elapsed_ms));
+                        }
+                    }
+                    sys_transcribe_buffer.clear();
                 }
             }
+
+            last_transcribe = Instant::now();
         }
 
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Flush remaining
-    let elapsed = start_time.elapsed();
-    for (idx, buffer) in phrase_buffers.iter_mut().enumerate() {
-        if let Some((start, end, text)) = buffer.flush(elapsed) {
-            let _ = event_tx.send(AppEvent::Transcript {
-                source: sources[idx],
-                text,
-                start_ms: start.as_millis() as u64,
-                end_ms: end.as_millis() as u64,
-            });
+    // Final transcription of remaining audio
+    if let Some(ref mut whisper) = transcriber {
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+
+        if mic_transcribe_buffer.len() >= min_samples / 2 {
+            if let Ok(result) = whisper.transcribe(&mic_transcribe_buffer, target_rate) {
+                let text = result.text.trim().to_string();
+                if !text.is_empty() {
+                    let start_ms = elapsed_ms.saturating_sub(
+                        (mic_transcribe_buffer.len() as u64 * 1000) / target_rate as u64
+                    );
+                    let _ = transcript_tx.send((AudioSource::Mic, text, start_ms, elapsed_ms));
+                }
+            }
+        }
+
+        if sys_transcribe_buffer.len() >= min_samples / 2 {
+            if let Ok(result) = whisper.transcribe(&sys_transcribe_buffer, target_rate) {
+                let text = result.text.trim().to_string();
+                if !text.is_empty() {
+                    let start_ms = elapsed_ms.saturating_sub(
+                        (sys_transcribe_buffer.len() as u64 * 1000) / target_rate as u64
+                    );
+                    let _ = transcript_tx.send((AudioSource::Sys, text, start_ms, elapsed_ms));
+                }
+            }
         }
     }
 
@@ -530,4 +580,24 @@ fn run_transcription_loop(
         mic_samples: all_mic_samples,
         sys_samples: all_sys_samples,
     }
+}
+
+fn find_models_dir_internal() -> Option<PathBuf> {
+    let candidates = [
+        PathBuf::from("models"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("models")))
+            .unwrap_or_default(),
+        dirs::data_dir()
+            .map(|d| d.join("stt-cli").join("models"))
+            .unwrap_or_default(),
+    ];
+
+    for dir in &candidates {
+        if dir.join("sherpa-onnx-whisper-turbo").exists() {
+            return Some(dir.clone());
+        }
+    }
+    None
 }

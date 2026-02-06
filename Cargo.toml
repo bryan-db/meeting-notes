@@ -1,6 +1,6 @@
 [package]
 name = "stt-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -9,16 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
 cpal = "0.15"
-hf-hub = "0.4"
-kaudio = "0.2"
-moshi = "0.6"
-rubato = "0.15"
-sentencepiece = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -28,14 +20,10 @@ ratatui = "0.29"
 crossterm = "0.28"
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
-pyannote-rs = "0.3"
 eyre = "0.6"
-ort = { version = "=2.0.0-rc.10", features = ["ndarray"] }
 
-[features]
-default = ["metal"]
-metal = ["candle-core/metal", "candle-nn/metal"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# STT and speaker embedding
+sherpa-rs = { version = "0.6", features = ["download-binaries"] }
 
 [profile.release]
 opt-level = 3

@@ -1,3 +1,14 @@
+# Build artifacts
 /target/
 Cargo.lock
-/models/*.onnx
+
+# Models (auto-downloaded on first run)
+/models/
+
+# macOS
+.DS_Store
+
+# Test recordings
+*.wav
+*.m4a
+*.mp3

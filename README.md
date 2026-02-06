@@ -1,198 +1,171 @@
-# stt-cli
+# Meeting Notes CLI
 
-Real-time speech-to-text CLI with meeting transcription, speaker diarization, and interactive TUI. Powered by Kyutai STT with Metal acceleration on macOS.
+Real-time meeting transcription with speaker diarization and AI-generated summaries. Built for macOS with Whisper Turbo + WeSpeaker.
 
 ## Features
 
-- **Real-time transcription** from microphone or system audio
-- **Dual-source meeting mode** - captures your voice (mic) + remote participants (system audio) simultaneously
+- **Real-time transcription** using Whisper Turbo (whisper-large-v3-turbo)
+- **Speaker diarization** with WeSpeaker embeddings (pure Rust, no Python)
+- **Dual-source capture** - mic (you) + system audio (remote participants)
 - **Interactive TUI** with live transcript, markers, and notes
-- **Screenshot capture** - press `s` to capture screen regions, or drag-and-drop images
-- **Speaker diarization** - automatically identifies different speakers (pure Rust, no Python)
-- **AI summaries** - generates meeting summaries using Claude API
-- **JSONL event log** - structured output for LLM consumption (`tail -f events.jsonl | jq`)
-- **Privacy-focused** - audio is processed in memory only, never written to disk
+- **AI summaries** with action item extraction using Claude
+- **Screenshot capture** during meetings
+- **Auto-downloading models** (~500MB, downloaded on first run)
 
-## Installation
-
-### Prerequisites
-
-- macOS (Metal GPU acceleration)
-- Rust toolchain
-
-### Build
+## Quick Start
 
 ```bash
+# Build
 cargo build --release
+
+# Install to PATH (optional)
+sudo ln -sf $(pwd)/target/release/stt /usr/local/bin/stt
+
+# Record a meeting
+stt meeting -o "weekly-sync"
+
+# Models download automatically on first run
 ```
 
-### Diarization Models
+## Installation for LLMs/Agents
 
-Speaker diarization uses ONNX models (no Python needed). Download to `models/`:
-
-```bash
-mkdir -p models && cd models
-curl -LO https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/segmentation-3.0.onnx
-curl -LO https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/wespeaker_en_voxceleb_CAM++.onnx
-```
-
-### Summary Setup (Optional)
+To install this tool, run:
 
 ```bash
-# Set Anthropic API key for AI summaries
+# Clone the repository
+git clone https://github.com/databricks-field-eng/meeting-notes.git
+cd meeting-notes
+
+# Build
+cargo build --release
+
+# Add to PATH
+sudo ln -sf $(pwd)/target/release/stt /usr/local/bin/stt
+
+# Set API key for summaries
 export ANTHROPIC_API_KEY=sk-ant-xxxxx
 ```
 
+Models (~500MB) download automatically on first run to `~/Library/Application Support/stt-cli/models/`.
+
 ## Usage
 
-### Meeting Mode (Default)
-
-Record meetings with TUI, automatic speaker diarization, and AI summary:
+### Meeting Mode
 
 ```bash
-# Start meeting - creates ~/Documents/meetings/MOTOR/
-stt meeting -o "MOTOR"
+# Start meeting with TUI
+stt meeting -o "project-standup"
 
 # Auto-generated folder name
 stt meeting
-# → ~/Documents/meetings/meeting_20260205_143000/
+# → ~/Documents/meetings/meeting_20250205_143000/
 
-# Specify full path
-stt meeting -o /path/to/session
-
-# Disable diarization
-stt meeting -o "MOTOR" --no-diarize
-
-# Disable AI summary
-stt meeting -o "MOTOR" --no-summary
-
-# Plain text mode (no TUI)
-stt meeting -o "MOTOR" --no-tui
-
-# Specify microphone
-stt meeting -o "MOTOR" --mic "Anker"
-
-# List available audio devices
+# List audio devices
 stt meeting --list-devices
+
+# Skip diarization or summary
+stt meeting -o "quick-call" --no-diarize --no-summary
 ```
 
 ### TUI Keybindings
 
 | Key | Action |
 |-----|--------|
-| `s` | Screenshot (interactive region select) |
+| `q` | Quit and generate summary |
+| `m` | Add marker (ACTION_ITEM, DECISION, etc.) |
+| `n` | Add manual note |
+| `s` | Screenshot (region select) |
 | `S` | Screenshot (window select) |
-| `m` | Add marker (type label, Enter to submit) |
-| `n` | Add note (type text, Enter to submit) |
-| `j/k` or `↓/↑` | Scroll transcript |
-| `G` | Jump to bottom (enable auto-scroll) |
-| `g` | Jump to top |
-| `q` | Quit |
+| `↑/↓` | Scroll transcript |
+| `PgUp/PgDn` | Page scroll |
 
-**Drag-and-drop**: Drag an image file onto the terminal to import it.
+### Listen Mode
 
-### File Transcription
-
-Transcribe audio/video files:
-
-```bash
-stt file recording.m4a
-stt file meeting.wav -o transcript.md
-stt file video.mp4 --format json --words
-```
-
-### Real-time Listen Mode
-
-Simple single-source transcription:
+Simple real-time transcription:
 
 ```bash
 stt listen
-stt listen --device "MacBook Pro Microphone"
+stt listen --device "AirPods"
 ```
 
-## Session Folder Structure
+### File Transcription
+
+```bash
+stt file recording.wav
+stt file meeting.m4a --diarize
+```
+
+## Meeting Folder Structure
 
 ```
-~/Documents/meetings/MOTOR/
-├── CONTEXT.md        # (Optional) Meeting context from calendar agent
-├── events.jsonl      # Transcript + events (source of truth)
-├── SUMMARY.md        # AI-generated meeting summary
+~/Documents/meetings/weekly-sync/
+├── CONTEXT.md        # Meeting context (improves summary quality)
+├── PROMPT.md         # Custom summary prompt (optional)
+├── events.jsonl      # Raw transcript + events
+├── SUMMARY.md        # AI-generated summary with action items
 └── screenshots/
-    ├── 001.png
-    ├── 002.png
-    └── ...
+    └── 001.png
 ```
 
-**Note**: Audio is processed in memory and never saved to disk. This is intentional for privacy - only the text transcript is persisted.
+### CONTEXT.md
 
-If a `CONTEXT.md` file exists in the session folder (e.g., created by a calendar agent with meeting details, attendees, agenda), it will be included in the summarization prompt for better context.
+Create this **before** the meeting starts for better summaries:
 
-## JSONL Event Format
+```markdown
+# Meeting Context
 
-Each line is a JSON object. LLMs can consume this with `tail -f events.jsonl`:
+## Meeting Title
+Weekly Engineering Sync
 
-```jsonl
-{"type":"session_start","id":1,"ts":"2026-02-05T14:30:00Z","session_id":"mtg_20260205_143000"}
-{"type":"segment","id":2,"ts":"2026-02-05T14:30:05Z","src":"mic","text":"Good morning","start_ms":5000,"end_ms":7000}
-{"type":"segment","id":3,"ts":"2026-02-05T14:30:08Z","src":"sys","speaker":"SPEAKER_00","text":"Hi, let's get started","start_ms":8000,"end_ms":10000}
-{"type":"marker","id":4,"ts":"2026-02-05T14:30:15Z","offset_ms":15000,"label":"ACTION_ITEM"}
-{"type":"manual","id":5,"ts":"2026-02-05T14:30:20Z","offset_ms":20000,"text":"Follow up with DevOps"}
-{"type":"screenshot","id":6,"ts":"2026-02-05T14:30:25Z","offset_ms":25000,"filename":"001.png"}
-{"type":"session_end","id":7,"ts":"2026-02-05T15:00:00Z","duration_ms":1800000}
+## Attendees
+- Alice (Engineering Lead)
+- Bob (Backend)
+- Charlie (Frontend)
+
+## Purpose
+Review sprint progress and blockers
 ```
 
-### Event Types
+### PROMPT.md (Optional)
 
-| Type | Description |
-|------|-------------|
-| `session_start` | Meeting began |
-| `segment` | Transcribed speech (`src`: mic/sys, `speaker`: after diarization) |
-| `marker` | User-inserted marker (ACTION_ITEM, DECISION, etc.) |
-| `manual` | User-inserted note |
-| `screenshot` | Captured or imported image |
-| `session_end` | Meeting ended |
+Override the default summary prompt:
 
-## Audio Sources
-
-- **mic**: Your microphone input (your voice)
-- **sys**: System audio via ScreenCaptureKit (remote meeting participants)
-
-For system audio capture, the app uses macOS ScreenCaptureKit which requires Screen Recording permission.
-
-## Options
-
+```markdown
+Focus on technical decisions and action items only.
+Skip status updates and small talk.
+Use bullet points, no prose.
 ```
---cpu              Use CPU instead of Metal GPU
---model <MODEL>    HuggingFace model [default: kyutai/stt-2.6b-en-candle]
---no-tui           Disable TUI, use plain text output
---no-diarize       Skip automatic speaker diarization
---no-summary       Skip AI summary generation
---anthropic-key    Anthropic API key for summaries (or set ANTHROPIC_API_KEY env)
-```
+
+## Claude Code Skill
+
+A skill is included for Claude Code agents at `plugin/skills/meeting-recorder/SKILL.md`.
+
+The skill enables agents to:
+1. Check calendar for current meeting
+2. Create meeting folder with attendees
+3. Write CONTEXT.md from calendar details
+4. Run stt meeting in foreground
+5. Report summary location when done
+
+**Trigger phrases**: "record meeting", "transcribe meeting", "meeting notes"
+
+## Requirements
+
+- **macOS** (uses ScreenCaptureKit for system audio)
+- **Screen Recording permission** (System Settings > Privacy > Screen Recording)
+- **ANTHROPIC_API_KEY** for AI summaries (optional)
 
 ## Privacy
 
-Audio is kept in memory during the meeting for real-time transcription and speaker diarization. When the meeting ends:
+- Audio is processed **in memory only** - never written to disk
+- Transcription uses local ONNX models (Whisper + WeSpeaker)
+- Only text transcript and screenshots are saved
+- Summary generation requires Anthropic API (optional)
 
-1. Audio is processed with local ONNX models for speaker identification (no network calls)
-2. Speaker labels are added to the transcript
-3. Audio buffers are dropped (freed from memory)
-4. **No audio files are ever written to disk**
+## Technical Details
 
-Only the text transcript (events.jsonl), screenshots, and summary are persisted.
-
-## Tips
-
-- **Watch live**: `tail -f events.jsonl | jq -c .`
-- **Filter by speaker**: `jq 'select(.speaker == "SPEAKER_00")' events.jsonl`
-- **Extract action items**: `jq 'select(.type == "marker" and .label == "ACTION_ITEM")' events.jsonl`
-- **Get full transcript**: `jq -r 'select(.type == "segment") | "[\(.src)] \(.text)"' events.jsonl`
-
-## Memory Usage
-
-Audio buffers use approximately:
-- ~48 KB/second per source (24kHz mono, 32-bit float)
-- ~170 MB/hour per source
-- ~340 MB/hour for dual-source (mic + system)
-
-A typical 1-hour meeting uses ~350 MB of RAM for audio buffers.
+- **STT**: Whisper Turbo (whisper-large-v3-turbo, int8 quantized)
+- **Speaker Embeddings**: WeSpeaker ResNet293-LM (0.45% EER)
+- **Sample Rate**: 16kHz (Whisper requirement)
+- **Transcription**: Periodic (every 5 seconds of audio)
+- **Clustering**: Cosine similarity with 0.6 threshold
