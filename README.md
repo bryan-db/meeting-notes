@@ -12,38 +12,77 @@ Real-time meeting transcription with speaker diarization and AI-generated summar
 - **Screenshot capture** during meetings
 - **Auto-downloading models** (~500MB, downloaded on first run)
 
-## Quick Start
+## Installation
+
+### For LLM Agents
+
+Follow these steps in order. Check each prerequisite before proceeding.
+
+#### Step 1: Install Rust (if not installed)
 
 ```bash
-# Build
-cargo build --release
+# Check if cargo exists
+which cargo
 
-# Install to PATH (optional)
-sudo ln -sf $(pwd)/target/release/stt /usr/local/bin/stt
+# If not found, install Rust via Homebrew
+brew install rust
 
-# Record a meeting
-stt meeting -o "weekly-sync"
-
-# Models download automatically on first run
+# Or via rustup (alternative)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
 ```
 
-## Installation for LLMs/Agents
-
-To install this tool, run:
+#### Step 2: Clone and Build
 
 ```bash
-# Clone the repository
-git clone https://github.com/bryan-db/meeting-notes.git
-cd meeting-notes
-
-# Build
+git clone https://github.com/bryan-db/meeting-notes.git ~/meeting-notes
+cd ~/meeting-notes
 cargo build --release
+```
 
-# Add to PATH
-sudo ln -sf $(pwd)/target/release/stt /usr/local/bin/stt
+#### Step 3: Install to PATH
 
-# Set API key for summaries
+```bash
+# Option A: Using cargo install (recommended)
+cargo install --path .
+
+# Option B: Manual symlink (requires sudo)
+sudo ln -sf ~/meeting-notes/target/release/stt /usr/local/bin/stt
+
+# Option C: User-local install (no sudo)
+mkdir -p ~/.local/bin
+ln -sf ~/meeting-notes/target/release/stt ~/.local/bin/stt
+# Add to PATH if not already: export PATH="$HOME/.local/bin:$PATH"
+```
+
+#### Step 4: Verify Installation
+
+```bash
+stt --help
+```
+
+#### Step 5: Grant Permissions (macOS)
+
+The app needs Screen Recording permission for system audio capture:
+1. Run `stt meeting` once (it will fail but trigger the permission prompt)
+2. Go to **System Settings > Privacy & Security > Screen Recording**
+3. Enable permission for the terminal app you're using
+
+#### Step 6: Set API Key (Optional, for AI summaries)
+
+```bash
 export ANTHROPIC_API_KEY=sk-ant-xxxxx
+# Add to ~/.zshrc or ~/.bashrc to persist
+```
+
+### Quick Start (for humans)
+
+```bash
+brew install rust
+git clone https://github.com/bryan-db/meeting-notes.git ~/meeting-notes
+cd ~/meeting-notes
+cargo install --path .
+stt meeting -o "my-meeting"
 ```
 
 Models (~500MB) download automatically on first run to `~/Library/Application Support/stt-cli/models/`.
