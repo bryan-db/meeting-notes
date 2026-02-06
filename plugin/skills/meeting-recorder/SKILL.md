@@ -9,9 +9,20 @@ Record meetings with real-time transcription, speaker diarization, and AI-genera
 
 ## Prerequisites
 
-- stt binary at `~/Projects/phase0/utils/meeting-notes/stt-cli/target/release/stt`
+- `stt` binary in PATH (or at `~/meeting-notes/target/release/stt`)
 - ANTHROPIC_API_KEY environment variable
 - Screen Recording permission granted
+
+## Installation (if not installed)
+
+```bash
+git clone https://github.com/bryan-db/meeting-notes.git ~/meeting-notes
+cd ~/meeting-notes
+cargo build --release
+sudo ln -sf $(pwd)/target/release/stt /usr/local/bin/stt
+```
+
+Models (~500MB) auto-download on first run.
 
 ## Instructions
 
@@ -89,8 +100,7 @@ Examples:
 Run the stt command in the **foreground** (the user needs to see the TUI):
 
 ```bash
-~/Projects/phase0/utils/meeting-notes/stt-cli/target/release/stt meeting \
-  --output ~/Documents/meetings/<folder-name>
+stt meeting --output ~/Documents/meetings/<folder-name>
 ```
 
 **Tell the user:**

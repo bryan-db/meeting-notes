@@ -20,18 +20,20 @@ Record meetings with calendar integration for automatic folder naming.
 
 ## Installation
 
-1. Build the stt-cli binary:
-   ```bash
-   cd ~/Projects/phase0/utils/meeting-notes/stt-cli
-   cargo build --release
-   ```
+```bash
+# Clone and build
+git clone https://github.com/bryan-db/meeting-notes.git ~/meeting-notes
+cd ~/meeting-notes
+cargo build --release
 
-2. Symlink to PATH (optional):
-   ```bash
-   sudo ln -sf ~/Projects/phase0/utils/meeting-notes/stt-cli/target/release/stt /usr/local/bin/stt
-   ```
+# Add to PATH
+sudo ln -sf $(pwd)/target/release/stt /usr/local/bin/stt
 
-3. Models auto-download on first run (~500MB)
+# Set API key for summaries
+export ANTHROPIC_API_KEY=sk-ant-xxxxx
+```
+
+Models (~500MB) auto-download on first run.
 
 ## Requirements
 

@@ -33,7 +33,7 @@ To install this tool, run:
 
 ```bash
 # Clone the repository
-git clone https://github.com/databricks-field-eng/meeting-notes.git
+git clone https://github.com/bryan-db/meeting-notes.git
 cd meeting-notes
 
 # Build
