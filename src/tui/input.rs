@@ -62,14 +62,28 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, visible_height: usize) -> Ke
             app.clear_paste_buffer();
             KeyAction::CaptureWindowScreenshot
         }
-        KeyCode::Char('j') | KeyCode::Down => {
+        KeyCode::Down => {
             app.clear_paste_buffer();
             app.scroll_down(visible_height);
             KeyAction::None
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Up => {
             app.clear_paste_buffer();
             app.scroll_up();
+            KeyAction::None
+        }
+        KeyCode::PageDown => {
+            app.clear_paste_buffer();
+            for _ in 0..visible_height {
+                app.scroll_down(visible_height);
+            }
+            KeyAction::None
+        }
+        KeyCode::PageUp => {
+            app.clear_paste_buffer();
+            for _ in 0..visible_height {
+                app.scroll_up();
+            }
             KeyAction::None
         }
         KeyCode::Char('G') => {

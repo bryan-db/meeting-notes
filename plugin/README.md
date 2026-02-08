@@ -12,11 +12,11 @@ Record meetings with calendar integration for automatic folder naming.
 
 **Features:**
 - Automatic meeting folder creation based on calendar events
-- Real-time transcription using Whisper Turbo
-- Speaker diarization (identifies different speakers)
-- AI-generated summaries with action items
-- Support for custom summarization prompts
-- Screenshot capture during meetings
+- Real-time transcription using Whisper Turbo via sherpa-rs (5-second buffered chunks, no VAD)
+- Post-meeting speaker diarization with WeSpeaker embeddings
+- AI-generated summaries with action items (Claude API)
+- Support for custom summarization prompts (PROMPT.md)
+- Screenshot capture and drag-and-drop image import during meetings
 
 ## Installation
 

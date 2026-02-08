@@ -257,7 +257,8 @@ Keyboard shortcuts:
 - q : End meeting and generate summary
 - m : Add marker (ACTION_ITEM, DECISION, BLOCKER)
 - n : Add manual note
-- s : Capture screenshot
+- s : Capture screenshot (region), S : screenshot (window)
+- j/k or ↑/↓ : Scroll transcript, G/g : jump to bottom/top
 
 When you're done, press 'q' to generate the summary with UCO recommendations.
 ```
@@ -325,8 +326,8 @@ Agent:
 | n | Add manual note |
 | s | Screenshot (region selection) |
 | S | Screenshot (window selection) |
-| ↑/↓ | Scroll transcript |
-| PgUp/PgDn | Page scroll |
+| j/↓ | Scroll down |
+| k/↑ | Scroll up |
 | G | Jump to bottom |
 | g | Jump to top |
 

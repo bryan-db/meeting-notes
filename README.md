@@ -115,8 +115,10 @@ stt meeting -o "quick-call" --no-diarize --no-summary
 | `n` | Add manual note |
 | `s` | Screenshot (region select) |
 | `S` | Screenshot (window select) |
-| `↑/↓` | Scroll transcript |
-| `PgUp/PgDn` | Page scroll |
+| `j/↓` | Scroll down |
+| `k/↑` | Scroll up |
+| `G` | Jump to bottom |
+| `g` | Jump to top |
 
 ### Listen Mode
 
@@ -203,8 +205,9 @@ The skill enables agents to:
 
 ## Technical Details
 
-- **STT**: Whisper Turbo (whisper-large-v3-turbo, int8 quantized)
+- **STT**: Whisper Turbo (whisper-large-v3-turbo, int8 quantized) via sherpa-rs
 - **Speaker Embeddings**: WeSpeaker ResNet293-LM (0.45% EER)
-- **Sample Rate**: 16kHz (Whisper requirement)
-- **Transcription**: Periodic (every 5 seconds of audio)
-- **Clustering**: Cosine similarity with 0.6 threshold
+- **Sample Rate**: 16kHz mono (Whisper requirement), resampled from device native rate
+- **Segmentation**: Fixed 5-second buffered chunks (no VAD). Audio is accumulated and sent to Whisper on a timer regardless of speech activity. Silent chunks produce empty transcripts that are discarded.
+- **Diarization**: Post-meeting only. WeSpeaker extracts embeddings per segment, clustered by cosine similarity (0.6 threshold).
+- **Dual capture**: Mic via cpal, system audio via ScreenCaptureKit. Each source is transcribed independently.

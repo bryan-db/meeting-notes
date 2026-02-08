@@ -1,6 +1,6 @@
 [package]
 name = "stt-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -18,12 +18,25 @@ signal-hook = "0.3"
 screencapturekit = "1.5"
 ratatui = "0.29"
 crossterm = "0.28"
-uuid = { version = "1", features = ["v4"] }
 dirs = "5"
-eyre = "0.6"
+libc = "0.2"
 
-# STT and speaker embedding
+# STT and speaker embedding (post-session Whisper Large V3 + diarization)
 sherpa-rs = { version = "0.6", features = ["download-binaries"] }
+
+# Kyutai STT streaming (real-time transcription)
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+moshi = "0.6"
+hf-hub = "0.4"
+sentencepiece = "0.11"
+kaudio = "0.2"
+
+[features]
+default = ["metal"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 
 [profile.release]
 opt-level = 3

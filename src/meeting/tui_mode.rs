@@ -1,10 +1,12 @@
 // Integrated TUI meeting mode with JSONL logging
-// Uses Whisper for periodic transcription
+// Pass 1: Kyutai STT streaming for real-time transcription
+// Audio stored at 16kHz for post-session Whisper Large V3 retranscription
 
 use crate::events::{AudioSource, Event};
 use crate::jsonl_writer::JsonlWriter;
+use crate::kyutai::{self, KyutaiTranscriber};
+use crate::phrase_buffer::PhraseBuffer;
 use crate::tui::{draw, handle_key, App, KeyAction};
-use crate::WhisperTranscriber;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -15,7 +17,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 use std::io::{self, Stdout};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -35,11 +37,13 @@ use screencapturekit::{
     },
 };
 
+
 /// Audio data collected during transcription (kept in memory, never written to disk)
+/// Stored at 16kHz for Whisper Large V3 post-session retranscription
 #[derive(Debug, Default)]
 pub struct RecordedAudio {
-    pub mic_samples: Vec<f32>,
-    pub sys_samples: Vec<f32>,
+    pub mic_samples: Vec<f32>,  // 16kHz mono
+    pub sys_samples: Vec<f32>,  // 16kHz mono
 }
 
 impl RecordedAudio {
@@ -104,6 +108,9 @@ impl SimpleResampler {
     }
 
     pub fn process(&self, samples: &[f32]) -> Vec<f32> {
+        if samples.is_empty() {
+            return Vec::new();
+        }
         let output_len = (samples.len() as f64 / self.ratio).ceil() as usize;
         let mut output = Vec::with_capacity(output_len);
 
@@ -126,7 +133,7 @@ impl SimpleResampler {
     }
 }
 
-fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+pub fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     if channels == 1 {
         samples.to_vec()
     } else {
@@ -147,11 +154,12 @@ pub fn ctrlc_handler(running: Arc<AtomicBool>) {
     });
 }
 
-/// Run meeting mode with TUI using sherpa-rs Whisper
-/// Returns RecordedAudio containing mic and system audio samples (in memory)
-pub fn run_tui_meeting_sherpa(
+/// Run meeting mode with TUI using Kyutai STT streaming (Pass 1)
+/// Returns RecordedAudio containing mic and system audio at 16kHz for post-processing
+pub fn run_tui_meeting(
     mic_device: Option<&str>,
     session_folder: &Path,
+    cpu: bool,
 ) -> Result<RecordedAudio> {
     // Create session folder structure
     std::fs::create_dir_all(session_folder)?;
@@ -160,7 +168,45 @@ pub fn run_tui_meeting_sherpa(
 
     let events_path = session_folder.join("events.jsonl");
 
-    // Initialize terminal
+    // Load Kyutai STT BEFORE entering TUI
+    eprint!("Loading Kyutai STT model...");
+    let kyutai_stt: Option<KyutaiTranscriber> = {
+        // Redirect stderr to /dev/null during model loading to suppress
+        // internal moshi/candle/hf-hub messages that would pollute the TUI
+        use std::os::unix::io::AsRawFd;
+        let stderr_fd = std::io::stderr().as_raw_fd();
+        let saved_stderr = unsafe { libc::dup(stderr_fd) };
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .ok();
+        if let Some(ref dn) = devnull {
+            unsafe { libc::dup2(dn.as_raw_fd(), stderr_fd) };
+        }
+
+        let result = kyutai::get_device(cpu).ok().and_then(|dev| {
+            KyutaiTranscriber::load(kyutai::MODEL_REPO, &dev, 2).ok()
+        });
+
+        // Restore stderr
+        if saved_stderr >= 0 {
+            unsafe { libc::dup2(saved_stderr, stderr_fd) };
+            unsafe { libc::close(saved_stderr) };
+        }
+
+        result
+    };
+
+    if kyutai_stt.is_some() {
+        eprintln!(" ready.");
+    } else {
+        eprintln!(" not available (will retranscribe post-session).");
+    }
+
+    // Clear screen before entering alternate screen to prevent any leaked output
+    execute!(io::stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+
+    // Initialize terminal (AFTER model loading)
     enable_raw_mode()?;
     let _guard = TerminalGuard;
 
@@ -170,11 +216,12 @@ pub fn run_tui_meeting_sherpa(
     let mut terminal = Terminal::new(backend)?;
 
     // Run the main loop
-    let recorded_audio = run_meeting_loop_sherpa(
+    let recorded_audio = run_meeting_loop(
         &mut terminal,
         mic_device,
         &events_path,
         &screenshots_dir,
+        kyutai_stt,
     )?;
 
     terminal.show_cursor()?;
@@ -182,11 +229,12 @@ pub fn run_tui_meeting_sherpa(
     Ok(recorded_audio)
 }
 
-fn run_meeting_loop_sherpa(
+fn run_meeting_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mic_device: Option<&str>,
     events_path: &Path,
     screenshots_dir: &Path,
+    kyutai_stt: Option<KyutaiTranscriber>,
 ) -> Result<RecordedAudio> {
     let host = cpal::default_host();
 
@@ -210,7 +258,6 @@ fn run_meeting_loop_sherpa(
     let mic_rate = mic_config.sample_rate().0;
     let mic_channels = mic_config.channels() as usize;
     let sys_rate = 48000u32;
-    let target_rate = 16000u32; // Whisper expects 16kHz
 
     // Initialize JSONL writer
     let mut writer = JsonlWriter::new(events_path)?;
@@ -235,7 +282,7 @@ fn run_meeting_loop_sherpa(
     let (mic_tx, mic_rx) = mpsc::channel::<Vec<f32>>();
     let (sys_tx, sys_rx) = mpsc::channel::<Vec<f32>>();
 
-    // Transcript channel
+    // Transcript channel (from transcription thread to TUI)
     let (transcript_tx, transcript_rx) = mpsc::channel::<(AudioSource, String, u64, u64)>();
 
     let running = Arc::new(AtomicBool::new(true));
@@ -276,7 +323,7 @@ fn run_meeting_loop_sherpa(
             let mono = to_mono(data, mic_channels_clone);
             let _ = mic_tx.send(mono);
         },
-        |err| eprintln!("Mic error: {}", err),
+        |_err| { /* Can't write to stderr while TUI is active */ },
         None,
     )?;
     mic_stream.play()?;
@@ -289,9 +336,9 @@ fn run_meeting_loop_sherpa(
             sys_rx,
             mic_rate,
             sys_rate,
-            target_rate,
             transcript_tx,
             running_clone,
+            kyutai_stt,
         )
     });
 
@@ -442,6 +489,20 @@ fn run_meeting_loop_sherpa(
         .join()
         .map_err(|_| anyhow::anyhow!("Audio thread panicked"))?;
 
+    // Drain any final transcript events sent during shutdown
+    while let Ok((source, text, start_ms, end_ms)) = transcript_rx.try_recv() {
+        let event = Event::Segment {
+            id: writer.next_id(),
+            ts: Utc::now(),
+            src: source,
+            text,
+            start_ms,
+            end_ms,
+        };
+        writer.write(&event)?;
+        app.add_event(event);
+    }
+
     // Write session end
     let end_event = Event::SessionEnd {
         id: writer.next_id(),
@@ -453,151 +514,162 @@ fn run_meeting_loop_sherpa(
     Ok(recorded_audio)
 }
 
-/// Collect audio and run periodic transcription
+/// Collect audio and run Kyutai STT streaming transcription
+/// Audio is resampled to both 24kHz (for Kyutai real-time) and 16kHz (for post-session Whisper)
 fn run_audio_collection(
     mic_rx: mpsc::Receiver<Vec<f32>>,
     sys_rx: mpsc::Receiver<Vec<f32>>,
     mic_rate: u32,
     sys_rate: u32,
-    target_rate: u32,
     transcript_tx: mpsc::Sender<(AudioSource, String, u64, u64)>,
     running: Arc<AtomicBool>,
+    mut kyutai_stt: Option<KyutaiTranscriber>,
 ) -> RecordedAudio {
-    let mic_resampler = SimpleResampler::new(mic_rate, target_rate);
-    let sys_resampler = SimpleResampler::new(sys_rate, target_rate);
+    // Resamplers: native rate → 16kHz (for storage) and → 24kHz (for Kyutai)
+    let mic_resampler_16k = SimpleResampler::new(mic_rate, 16000);
+    let sys_resampler_16k = SimpleResampler::new(sys_rate, 16000);
+    let mic_resampler_24k = SimpleResampler::new(mic_rate, kyutai::SAMPLE_RATE);
+    let sys_resampler_24k = SimpleResampler::new(sys_rate, kyutai::SAMPLE_RATE);
 
-    let mut all_mic_samples = Vec::new();
-    let mut all_sys_samples = Vec::new();
+    // 16kHz storage for Whisper post-processing
+    let mut all_mic_16k = Vec::new();
+    let mut all_sys_16k = Vec::new();
 
-    // Buffers for periodic transcription
-    let mut mic_transcribe_buffer = Vec::new();
-    let mut sys_transcribe_buffer = Vec::new();
+    // 24kHz buffers for Kyutai chunk processing
+    let mut mic_chunk_buffer = Vec::new();
+    let mut sys_chunk_buffer = Vec::new();
+
+    // Phrase buffers for readable TUI output
+    let mut mic_phrase = PhraseBuffer::new();
+    let mut sys_phrase = PhraseBuffer::new();
 
     let start_time = Instant::now();
-    let mut last_transcribe = Instant::now();
-    let transcribe_interval = Duration::from_secs(5); // Transcribe every 5 seconds
-    let min_samples = target_rate as usize * 2; // Minimum 2 seconds of audio
-
-    // Try to load Whisper (optional - may fail if models not found)
-    let models_dir = find_models_dir_internal();
-    let mut transcriber: Option<WhisperTranscriber> = models_dir
-        .as_ref()
-        .and_then(|dir| {
-            WhisperTranscriber::new(&dir.join("sherpa-onnx-whisper-turbo")).ok()
-        });
-
-    if transcriber.is_none() {
-        eprintln!("Note: Whisper models not found, recording audio only");
-    }
 
     while running.load(Ordering::SeqCst) {
         // Collect mic audio
         while let Ok(samples) = mic_rx.try_recv() {
-            let resampled = mic_resampler.process(&samples);
-            all_mic_samples.extend(resampled.iter().copied());
-            mic_transcribe_buffer.extend(resampled);
+            // Store at 16kHz for post-processing
+            let r16 = mic_resampler_16k.process(&samples);
+            all_mic_16k.extend(&r16);
+
+            // Buffer at 24kHz for Kyutai
+            if kyutai_stt.is_some() {
+                let r24 = mic_resampler_24k.process(&samples);
+                mic_chunk_buffer.extend(r24);
+            }
         }
 
         // Collect system audio
         while let Ok(samples) = sys_rx.try_recv() {
-            let resampled = sys_resampler.process(&samples);
-            all_sys_samples.extend(resampled.iter().copied());
-            sys_transcribe_buffer.extend(resampled);
+            let r16 = sys_resampler_16k.process(&samples);
+            all_sys_16k.extend(&r16);
+
+            if kyutai_stt.is_some() {
+                let r24 = sys_resampler_24k.process(&samples);
+                sys_chunk_buffer.extend(r24);
+            }
         }
 
-        // Periodic transcription
-        if last_transcribe.elapsed() >= transcribe_interval {
-            if let Some(ref mut whisper) = transcriber {
-                let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        // Process chunks with Kyutai (batched: mic + sys simultaneously)
+        // When one source is silent, pad it with zeros so the other keeps transcribing
+        if let Some(ref mut kyutai) = kyutai_stt {
+            while mic_chunk_buffer.len() >= kyutai::CHUNK_SIZE
+                || sys_chunk_buffer.len() >= kyutai::CHUNK_SIZE
+            {
+                let mic_chunk: Vec<f32> = if mic_chunk_buffer.len() >= kyutai::CHUNK_SIZE {
+                    mic_chunk_buffer.drain(..kyutai::CHUNK_SIZE).collect()
+                } else {
+                    vec![0.0; kyutai::CHUNK_SIZE] // silence pad
+                };
+                let sys_chunk: Vec<f32> = if sys_chunk_buffer.len() >= kyutai::CHUNK_SIZE {
+                    sys_chunk_buffer.drain(..kyutai::CHUNK_SIZE).collect()
+                } else {
+                    vec![0.0; kyutai::CHUNK_SIZE] // silence pad
+                };
 
-                // Transcribe mic buffer
-                if mic_transcribe_buffer.len() >= min_samples {
-                    let start_ms = elapsed_ms.saturating_sub(
-                        (mic_transcribe_buffer.len() as u64 * 1000) / target_rate as u64
-                    );
+                match kyutai.process_batched_chunks(&[&mic_chunk, &sys_chunk]) {
+                    Ok(results) => {
+                        let now = Instant::now();
+                        let elapsed_ms = start_time.elapsed().as_millis() as u64;
 
-                    if let Ok(result) = whisper.transcribe(&mic_transcribe_buffer, target_rate) {
-                        let text = result.text.trim().to_string();
-                        if !text.is_empty() {
-                            let _ = transcript_tx.send((AudioSource::Mic, text, start_ms, elapsed_ms));
+                        for (batch_idx, word) in results {
+                            match batch_idx {
+                                0 => {
+                                    // Check if other source should flush first (turn-taking)
+                                    if !sys_phrase.is_empty() && sys_phrase.quiet_for_ms() > 300 {
+                                        if let Some((phrase_time, text)) = sys_phrase.flush() {
+                                            let phrase_ms = phrase_time.duration_since(start_time).as_millis() as u64;
+                                            let _ = transcript_tx.send((
+                                                AudioSource::Sys, text,
+                                                phrase_ms.min(elapsed_ms), elapsed_ms,
+                                            ));
+                                        }
+                                    }
+                                    mic_phrase.add_word(word, now);
+                                }
+                                1 => {
+                                    if !mic_phrase.is_empty() && mic_phrase.quiet_for_ms() > 300 {
+                                        if let Some((phrase_time, text)) = mic_phrase.flush() {
+                                            let phrase_ms = phrase_time.duration_since(start_time).as_millis() as u64;
+                                            let _ = transcript_tx.send((
+                                                AudioSource::Mic, text,
+                                                phrase_ms.min(elapsed_ms), elapsed_ms,
+                                            ));
+                                        }
+                                    }
+                                    sys_phrase.add_word(word, now);
+                                }
+                                _ => {}
+                            }
                         }
                     }
-                    mic_transcribe_buffer.clear();
-                }
-
-                // Transcribe system buffer
-                if sys_transcribe_buffer.len() >= min_samples {
-                    let start_ms = elapsed_ms.saturating_sub(
-                        (sys_transcribe_buffer.len() as u64 * 1000) / target_rate as u64
-                    );
-
-                    if let Ok(result) = whisper.transcribe(&sys_transcribe_buffer, target_rate) {
-                        let text = result.text.trim().to_string();
-                        if !text.is_empty() {
-                            let _ = transcript_tx.send((AudioSource::Sys, text, start_ms, elapsed_ms));
-                        }
+                    Err(_) => {
+                        // Silently ignore - can't write to stderr while TUI is active
                     }
-                    sys_transcribe_buffer.clear();
                 }
             }
 
-            last_transcribe = Instant::now();
+            // Flush completed phrases (silence threshold exceeded)
+            let elapsed_ms = start_time.elapsed().as_millis() as u64;
+
+            if mic_phrase.should_flush() {
+                if let Some((phrase_time, text)) = mic_phrase.flush() {
+                    let phrase_ms = phrase_time.duration_since(start_time).as_millis() as u64;
+                    let _ = transcript_tx.send((
+                        AudioSource::Mic, text,
+                        phrase_ms.min(elapsed_ms), elapsed_ms,
+                    ));
+                }
+            }
+
+            if sys_phrase.should_flush() {
+                if let Some((phrase_time, text)) = sys_phrase.flush() {
+                    let phrase_ms = phrase_time.duration_since(start_time).as_millis() as u64;
+                    let _ = transcript_tx.send((
+                        AudioSource::Sys, text,
+                        phrase_ms.min(elapsed_ms), elapsed_ms,
+                    ));
+                }
+            }
         }
 
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Final transcription of remaining audio
-    if let Some(ref mut whisper) = transcriber {
-        let elapsed_ms = start_time.elapsed().as_millis() as u64;
-
-        if mic_transcribe_buffer.len() >= min_samples / 2 {
-            if let Ok(result) = whisper.transcribe(&mic_transcribe_buffer, target_rate) {
-                let text = result.text.trim().to_string();
-                if !text.is_empty() {
-                    let start_ms = elapsed_ms.saturating_sub(
-                        (mic_transcribe_buffer.len() as u64 * 1000) / target_rate as u64
-                    );
-                    let _ = transcript_tx.send((AudioSource::Mic, text, start_ms, elapsed_ms));
-                }
-            }
-        }
-
-        if sys_transcribe_buffer.len() >= min_samples / 2 {
-            if let Ok(result) = whisper.transcribe(&sys_transcribe_buffer, target_rate) {
-                let text = result.text.trim().to_string();
-                if !text.is_empty() {
-                    let start_ms = elapsed_ms.saturating_sub(
-                        (sys_transcribe_buffer.len() as u64 * 1000) / target_rate as u64
-                    );
-                    let _ = transcript_tx.send((AudioSource::Sys, text, start_ms, elapsed_ms));
-                }
-            }
-        }
+    // Flush any remaining phrases
+    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+    if let Some((phrase_time, text)) = mic_phrase.flush() {
+        let phrase_ms = phrase_time.duration_since(start_time).as_millis() as u64;
+        let _ = transcript_tx.send((AudioSource::Mic, text, phrase_ms.min(elapsed_ms), elapsed_ms));
+    }
+    if let Some((phrase_time, text)) = sys_phrase.flush() {
+        let phrase_ms = phrase_time.duration_since(start_time).as_millis() as u64;
+        let _ = transcript_tx.send((AudioSource::Sys, text, phrase_ms.min(elapsed_ms), elapsed_ms));
     }
 
     RecordedAudio {
-        mic_samples: all_mic_samples,
-        sys_samples: all_sys_samples,
+        mic_samples: all_mic_16k,
+        sys_samples: all_sys_16k,
     }
 }
 
-fn find_models_dir_internal() -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from("models"),
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.join("models")))
-            .unwrap_or_default(),
-        dirs::data_dir()
-            .map(|d| d.join("stt-cli").join("models"))
-            .unwrap_or_default(),
-    ];
-
-    for dir in &candidates {
-        if dir.join("sherpa-onnx-whisper-turbo").exists() {
-            return Some(dir.clone());
-        }
-    }
-    None
-}

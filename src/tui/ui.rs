@@ -78,7 +78,7 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_input_area(frame: &mut Frame, app: &App, area: Rect) {
     let (title, content) = match app.input_mode {
         InputMode::Normal => {
-            let help = " 's' screenshot | 'm' marker | 'n' note | 'j/k' scroll | 'q' quit ";
+            let help = " 's' screenshot | 'm' marker | 'n' note | '↑↓' scroll | 'q' quit ";
             ("Help", help.to_string())
         }
         InputMode::Marker => {

@@ -101,10 +101,10 @@ impl App {
             || lower.ends_with(".bmp");
 
         if is_image {
-            let path = if trimmed.starts_with('~') {
-                // Expand ~ to home directory
+            let path = if trimmed.starts_with("~/") {
+                // Expand ~/ to home directory
                 if let Ok(home) = std::env::var("HOME") {
-                    PathBuf::from(home).join(&trimmed[2..]) // Skip "~/"
+                    PathBuf::from(home).join(trimmed.strip_prefix("~/").unwrap())
                 } else {
                     PathBuf::from(trimmed)
                 }
