@@ -1,6 +1,6 @@
 // Meeting Notes STT CLI - Two-Pass Transcription
 // Pass 1: Kyutai STT streaming (real-time, during meeting)
-// Pass 2: Whisper Large V3 batch (post-session, accurate)
+// Pass 2: Whisper Turbo batch via whisper.cpp Metal GPU (post-session, accurate)
 
 mod events;
 mod jsonl_writer;
@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Parser)]
 #[command(name = "stt")]
-#[command(about = "Meeting transcription: Kyutai STT streaming + Whisper Large V3 batch")]
+#[command(about = "Meeting transcription: Kyutai STT streaming + Whisper Turbo batch (Metal GPU)")]
 struct Args {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 
     /// Use CPU instead of Metal GPU (for Kyutai STT)
     #[arg(long, global = true)]
@@ -33,7 +33,7 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Transcribe an audio file (Whisper Large V3)
+    /// Transcribe an audio file (Whisper Turbo, Metal GPU)
     File {
         /// Audio input file (wav, mp3, etc.)
         input: PathBuf,
@@ -82,331 +82,101 @@ enum Commands {
         #[arg(long)]
         no_summary: bool,
 
-        /// Skip Whisper Large V3 retranscription (keep draft Kyutai segments)
+        /// Skip Whisper retranscription (keep draft Kyutai segments)
         #[arg(long)]
         no_retranscribe: bool,
 
         /// Anthropic API key for summaries (or set ANTHROPIC_API_KEY env)
         #[arg(long, env = "ANTHROPIC_API_KEY")]
         anthropic_key: Option<String>,
+
+        /// Meeting title displayed in the TUI header
+        #[arg(long)]
+        meeting_title: Option<String>,
     },
 }
 
 // ---------------------------------------------------------------------------
-// Whisper Transcribers (sherpa-rs)
+// Whisper Transcription (whisper-rs / whisper.cpp with Metal GPU)
 // ---------------------------------------------------------------------------
 
-/// Whisper model variant
-#[derive(Clone, Copy)]
-enum WhisperModel {
-    Turbo,
-    LargeV3,
-}
+/// Transcribe audio using whisper-rs (whisper.cpp with Metal acceleration).
+/// Audio must be 16kHz mono f32 samples. No manual chunking needed —
+/// whisper.cpp handles long audio internally with its own segmentation.
+fn whisper_transcribe(model_path: &Path, samples: &[f32], n_threads: i32) -> Result<TranscriptResult> {
+    use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 
-impl WhisperModel {
-    fn file_prefix(&self) -> &str {
-        match self {
-            WhisperModel::Turbo => "turbo",
-            WhisperModel::LargeV3 => "large-v3",
-        }
-    }
-}
+    let ctx = WhisperContext::new_with_params(
+        model_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid model path"))?,
+        WhisperContextParameters::default(),
+    ).map_err(|e| anyhow::anyhow!("Failed to load Whisper model: {}", e))?;
 
-/// Whisper transcriber (supports both Turbo and Large V3 via model variant)
-pub struct WhisperTranscriber {
-    recognizer: sherpa_rs::whisper::WhisperRecognizer,
-}
+    let mut state = ctx.create_state()
+        .map_err(|e| anyhow::anyhow!("Failed to create Whisper state: {}", e))?;
 
-impl WhisperTranscriber {
-    fn new(model_dir: &Path, model: WhisperModel) -> Result<Self> {
-        let prefix = model.file_prefix();
-        let config = sherpa_rs::whisper::WhisperConfig {
-            encoder: model_dir.join(format!("{}-encoder.int8.onnx", prefix)).to_string_lossy().into(),
-            decoder: model_dir.join(format!("{}-decoder.int8.onnx", prefix)).to_string_lossy().into(),
-            tokens: model_dir.join(format!("{}-tokens.txt", prefix)).to_string_lossy().into(),
-            language: "en".into(),
-            provider: Some("cpu".into()),
-            num_threads: Some(4),
-            ..Default::default()
-        };
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("en"));
+    params.set_n_threads(n_threads);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_special(false);
+    params.set_print_timestamps(false);
+    params.set_token_timestamps(true);
 
-        let recognizer = sherpa_rs::whisper::WhisperRecognizer::new(config)
-            .map_err(|e| anyhow::anyhow!("Failed to create Whisper {:?} recognizer: {:?}", prefix, e))?;
+    state.full(params, samples)
+        .map_err(|e| anyhow::anyhow!("Whisper transcription failed: {}", e))?;
 
-        Ok(Self { recognizer })
-    }
-
-    pub fn transcribe(&mut self, samples: &[f32], sample_rate: u32) -> Result<TranscriptResult> {
-        transcribe_with_recognizer(&mut self.recognizer, samples, sample_rate)
-    }
-}
-
-/// Get available system memory in bytes (macOS)
-fn available_memory_bytes() -> u64 {
-    #[cfg(target_os = "macos")]
-    {
-        let mut size: u64 = 0;
-        let mut len = std::mem::size_of::<u64>();
-        let mib = [libc::CTL_HW, libc::HW_MEMSIZE];
-        let ret = unsafe {
-            libc::sysctl(
-                mib.as_ptr() as *mut _,
-                2,
-                &mut size as *mut u64 as *mut _,
-                &mut len as *mut usize,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if ret == 0 { size } else { 16 * 1024 * 1024 * 1024 } // default 16GB
-    }
-    #[cfg(not(target_os = "macos"))]
-    { 16 * 1024 * 1024 * 1024 }
-}
-
-/// Calculate number of parallel Whisper workers based on available memory.
-/// Large V3 uses ~3GB per instance, Turbo ~400MB.
-fn whisper_worker_count(model: &WhisperModel) -> usize {
-    let mem = available_memory_bytes();
-    let reserved = 4u64 * 1024 * 1024 * 1024; // reserve 4GB for OS + other
-    let available = mem.saturating_sub(reserved);
-    let per_instance = match model {
-        WhisperModel::LargeV3 => 3u64 * 1024 * 1024 * 1024,
-        WhisperModel::Turbo => 400 * 1024 * 1024,
-    };
-    let workers = (available / per_instance).clamp(1, 8) as usize;
-    // Also cap by CPU cores
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    workers.min(cores)
-}
-
-/// Shared transcription logic for any Whisper model.
-/// Automatically chunks audio >25s to work around sherpa-rs 30s limit.
-/// Parallelizes across multiple recognizer instances for long audio.
-fn transcribe_with_recognizer(
-    recognizer: &mut sherpa_rs::whisper::WhisperRecognizer,
-    samples: &[f32],
-    sample_rate: u32,
-) -> Result<TranscriptResult> {
-    let max_chunk_samples = (25.0 * sample_rate as f32) as usize;
-
-    if samples.len() <= max_chunk_samples {
-        return transcribe_single_chunk(recognizer, samples, sample_rate, 0.0);
-    }
-
-    // For long audio, delegate to parallel transcription
-    // We need the model config from the existing recognizer to create more instances.
-    // Fall back to sequential if we can't determine the model.
-    transcribe_chunks_sequential(recognizer, samples, sample_rate)
-}
-
-/// Sequential chunk transcription (fallback)
-fn transcribe_chunks_sequential(
-    recognizer: &mut sherpa_rs::whisper::WhisperRecognizer,
-    samples: &[f32],
-    sample_rate: u32,
-) -> Result<TranscriptResult> {
-    let max_chunk_samples = (25.0 * sample_rate as f32) as usize;
-    let step_samples = (20.0 * sample_rate as f32) as usize;
-    let total_chunks = samples.len().div_ceil(step_samples);
-    let mut all_text = String::new();
-    let mut all_segments = Vec::new();
-    let mut offset = 0usize;
-
-    eprintln!("  Splitting into {} chunks (25s each, 5s overlap)...", total_chunks);
-
-    while offset < samples.len() {
-        let end = (offset + max_chunk_samples).min(samples.len());
-        let chunk = &samples[offset..end];
-        let chunk_start = offset as f32 / sample_rate as f32;
-        let chunk_end = ((offset + step_samples).min(samples.len())) as f32 / sample_rate as f32;
-
-        let chunk_num = offset / step_samples + 1;
-        eprint!("  Chunk {}/{} ({:.0}s-{:.0}s)... ", chunk_num, total_chunks, chunk_start, chunk_start + chunk.len() as f32 / sample_rate as f32);
-
-        match transcribe_single_chunk(recognizer, chunk, sample_rate, chunk_start) {
-            Ok(result) => {
-                eprintln!("{} chars", result.text.len());
-                let text = result.text.trim().to_string();
-                if !text.is_empty() {
-                    if !all_text.is_empty() {
-                        all_text.push(' ');
-                    }
-                    all_text.push_str(&text);
-                    all_segments.push(TranscriptSegment {
-                        start: chunk_start,
-                        end: chunk_end,
-                        text,
-                    });
-                }
-            }
-            Err(e) => {
-                eprintln!("failed: {}", e);
-            }
-        }
-
-        offset += step_samples;
-    }
-
-    Ok(TranscriptResult {
-        text: all_text,
-        segments: all_segments,
-    })
-}
-
-/// Parallel chunk transcription: creates multiple WhisperRecognizer instances
-/// and distributes chunks across threads.
-fn transcribe_parallel(
-    model_dir: &Path,
-    model: WhisperModel,
-    samples: &[f32],
-    sample_rate: u32,
-) -> Result<TranscriptResult> {
-    let max_chunk_samples = (25.0 * sample_rate as f32) as usize;
-    let step_samples = (20.0 * sample_rate as f32) as usize;
-
-    // Build list of chunks
-    let mut chunks: Vec<(usize, usize)> = Vec::new(); // (offset, end)
-    let mut offset = 0usize;
-    while offset < samples.len() {
-        let end = (offset + max_chunk_samples).min(samples.len());
-        chunks.push((offset, end));
-        offset += step_samples;
-    }
-
-    let n_workers = whisper_worker_count(&model).min(chunks.len());
-    eprintln!(
-        "  {} chunks, {} parallel workers ({:.0}GB RAM available)",
-        chunks.len(),
-        n_workers,
-        available_memory_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-    );
-
-    if n_workers <= 1 {
-        // Fall back to sequential with a single recognizer
-        let mut t = WhisperTranscriber::new(model_dir, model)?;
-        return transcribe_chunks_sequential(&mut t.recognizer, samples, sample_rate);
-    }
-
-    // Partition chunks into per-worker batches (round-robin for balanced load)
-    let mut worker_chunks: Vec<Vec<usize>> = vec![Vec::new(); n_workers];
-    for (i, _) in chunks.iter().enumerate() {
-        worker_chunks[i % n_workers].push(i);
-    }
-
-    // Process in parallel using scoped threads
-    let total_chunks = chunks.len();
-    let chunks_ref = &chunks;
-    let results: Vec<Option<(usize, f32, f32, String)>> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-
-        for (worker_id, chunk_indices) in worker_chunks.into_iter().enumerate() {
-            let model_dir = model_dir.to_path_buf();
-            let model_variant = model;
-
-            let handle = scope.spawn(move || {
-                let mut results = Vec::new();
-                let mut recognizer = match WhisperTranscriber::new(&model_dir, model_variant) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("  Worker {} failed to load model: {}", worker_id, e);
-                        return results;
-                    }
-                };
-
-                for &chunk_idx in &chunk_indices {
-                    let (off, end) = chunks_ref[chunk_idx];
-                    let chunk = &samples[off..end];
-                    let chunk_start = off as f32 / sample_rate as f32;
-                    let chunk_end = ((off + step_samples).min(samples.len())) as f32 / sample_rate as f32;
-
-                    match transcribe_single_chunk(&mut recognizer.recognizer, chunk, sample_rate, chunk_start) {
-                        Ok(result) => {
-                            let text = result.text.trim().to_string();
-                            if !text.is_empty() {
-                                results.push(Some((chunk_idx, chunk_start, chunk_end, text)));
-                            } else {
-                                results.push(None);
-                            }
-                        }
-                        Err(_) => {
-                            results.push(None);
-                        }
-                    }
-
-                    eprint!("\r  Transcribed {}/{} chunks", chunk_idx + 1, total_chunks);
-                }
-
-                results
-            });
-
-            handles.push(handle);
-        }
-
-        let mut all_results: Vec<Option<(usize, f32, f32, String)>> = Vec::new();
-        for handle in handles {
-            all_results.extend(handle.join().unwrap_or_default());
-        }
-        all_results
-    });
-
-    eprintln!();
-
-    // Sort results by chunk index and merge
-    let mut sorted: Vec<(usize, f32, f32, String)> = results.into_iter().flatten().collect();
-    sorted.sort_by_key(|(idx, _, _, _)| *idx);
+    let n_segments = state.full_n_segments();
 
     let mut all_text = String::new();
-    let mut all_segments = Vec::new();
-
-    for (_, chunk_start, chunk_end, text) in sorted {
-        if !all_text.is_empty() {
-            all_text.push(' ');
-        }
-        all_text.push_str(&text);
-        all_segments.push(TranscriptSegment {
-            start: chunk_start,
-            end: chunk_end,
-            text,
-        });
-    }
-
-    Ok(TranscriptResult {
-        text: all_text,
-        segments: all_segments,
-    })
-}
-
-fn transcribe_single_chunk(
-    recognizer: &mut sherpa_rs::whisper::WhisperRecognizer,
-    samples: &[f32],
-    sample_rate: u32,
-    time_offset: f32,
-) -> Result<TranscriptResult> {
-    let result = recognizer.transcribe(sample_rate, samples);
-
     let mut segments = Vec::new();
-    let n = result.timestamps.len().min(result.tokens.len());
-    for i in 0..n {
-        let start = result.timestamps[i] + time_offset;
-        let end = if i + 1 < n {
-            result.timestamps[i + 1] + time_offset
-        } else {
-            start + 0.5
+
+    for i in 0..n_segments {
+        let seg = match state.get_segment(i) {
+            Some(s) => s,
+            None => continue,
         };
-        segments.push(TranscriptSegment {
-            start,
-            end,
-            text: result.tokens[i].clone(),
-        });
+        let text = seg.to_str_lossy()
+            .map_err(|e| anyhow::anyhow!("Failed to get segment text: {}", e))?;
+        let t0 = seg.start_timestamp();
+        let t1 = seg.end_timestamp();
+
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            if !all_text.is_empty() {
+                all_text.push(' ');
+            }
+            all_text.push_str(trimmed);
+            segments.push(TranscriptSegment {
+                start: t0 as f32 / 100.0,
+                end: t1 as f32 / 100.0,
+                text: trimmed.to_string(),
+            });
+        }
     }
 
-    Ok(TranscriptResult {
-        text: result.text,
-        segments,
-    })
+    Ok(TranscriptResult { text: all_text, segments })
+}
+
+/// Find the GGML Whisper model file (prefers Turbo, falls back to Large V3)
+fn find_whisper_model(models_dir: &Path) -> Option<(PathBuf, &'static str)> {
+    let turbo = models_dir.join("ggml-large-v3-turbo.bin");
+    if turbo.exists() {
+        return Some((turbo, "Whisper Turbo"));
+    }
+    let large_v3 = models_dir.join("ggml-large-v3.bin");
+    if large_v3.exists() {
+        return Some((large_v3, "Whisper Large V3"));
+    }
+    None
+}
+
+/// Default thread count for Whisper decoder (encoder runs on Metal GPU)
+fn whisper_thread_count() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8) as i32
 }
 
 #[derive(Debug, Clone)]
@@ -421,13 +191,6 @@ pub struct TranscriptSegment {
     pub end: f32,
     pub text: String,
 }
-
-// ---------------------------------------------------------------------------
-// Speaker Diarization (sherpa-rs pyannote + 3dspeaker)
-// ---------------------------------------------------------------------------
-
-
-type WhisperFn = Box<dyn FnMut(&[f32], u32) -> Result<TranscriptResult>>;
 
 // ---------------------------------------------------------------------------
 // Audio Device Listing
@@ -471,8 +234,8 @@ fn find_models_dir() -> Result<PathBuf> {
     let models_dir = candidates
         .iter()
         .find(|dir| {
-            dir.join("sherpa-onnx-whisper-large-v3").exists()
-                || dir.join("sherpa-onnx-whisper-turbo").exists()
+            dir.join("ggml-large-v3-turbo.bin").exists()
+                || dir.join("ggml-large-v3.bin").exists()
         })
         .cloned()
         .or_else(|| dirs::data_dir().map(|d| d.join("stt-cli").join("models")))
@@ -507,9 +270,10 @@ fn download_tar_model(models_dir: &Path, name: &str, url: &str, message: &str) -
     }
 
     eprintln!("Extracting...");
+    let tar_filename = format!("{}.tar.bz2", name);
     let status = Command::new("tar")
         .args(["xjf"])
-        .arg(&tar_file)
+        .arg(&tar_filename)
         .current_dir(models_dir)
         .status()?;
 
@@ -528,19 +292,21 @@ fn download_models(models_dir: &Path) -> Result<()> {
 
     std::fs::create_dir_all(models_dir)?;
 
-    download_tar_model(
-        models_dir,
-        "sherpa-onnx-whisper-large-v3",
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-large-v3.tar.bz2",
-        "Downloading Whisper Large V3 model (~3GB, high accuracy)...",
-    )?;
-
-    download_tar_model(
-        models_dir,
-        "sherpa-onnx-whisper-turbo",
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2",
-        "Downloading Whisper Turbo model (~400MB, fallback)...",
-    )?;
+    // Whisper Turbo GGML model (whisper.cpp format, Metal GPU accelerated)
+    let whisper_model = models_dir.join("ggml-large-v3-turbo.bin");
+    if !whisper_model.exists() {
+        eprintln!("Downloading Whisper Turbo model (~809MB, Metal GPU accelerated)...");
+        let status = Command::new("curl")
+            .args(["-L", "-o"])
+            .arg(&whisper_model)
+            .arg("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin")
+            .arg("--progress-bar")
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("Failed to download Whisper Turbo model");
+        }
+        eprintln!("✓ Whisper Turbo model ready");
+    }
 
     // Diarization: pyannote segmentation model (tar archive)
     download_tar_model(
@@ -595,37 +361,20 @@ fn resolve_session_folder(output: Option<String>) -> Result<PathBuf> {
     Ok(folder)
 }
 
-/// Load best available Whisper model (prefers Large V3, falls back to Turbo)
-/// Returns (transcriber_fn, model_name) or None if no model found
-fn load_best_whisper(models_dir: &Path, context: &str) -> Result<Option<(WhisperFn, &'static str)>> {
-    let large_v3_dir = models_dir.join("sherpa-onnx-whisper-large-v3");
-    let turbo_dir = models_dir.join("sherpa-onnx-whisper-turbo");
-
-    if large_v3_dir.exists() {
-        eprintln!("Loading Whisper Large V3{}...", if context.is_empty() { "".to_string() } else { format!(" for {}", context) });
-        let mut t = WhisperTranscriber::new(&large_v3_dir, WhisperModel::LargeV3)?;
-        Ok(Some((Box::new(move |s, r| t.transcribe(s, r)), "Whisper Large V3")))
-    } else if turbo_dir.exists() {
-        eprintln!("Loading Whisper Turbo{}...", if context.is_empty() { "".to_string() } else { format!(" for {}", context) });
-        let mut t = WhisperTranscriber::new(&turbo_dir, WhisperModel::Turbo)?;
-        Ok(Some((Box::new(move |s, r| t.transcribe(s, r)), "Whisper Turbo")))
-    } else {
-        Ok(None)
-    }
-}
-
 // ---------------------------------------------------------------------------
-// File Transcription (Whisper Large V3)
+// File Transcription (Whisper Turbo via whisper-rs, Metal GPU)
 // ---------------------------------------------------------------------------
 
 fn transcribe_file(input: &Path, diarize: bool) -> Result<String> {
     let models_dir = find_models_dir()?;
 
-    let (mut transcriber, _model_name) = load_best_whisper(&models_dir, "")?
+    let (model_path, model_name) = find_whisper_model(&models_dir)
         .ok_or_else(|| anyhow::anyhow!("No Whisper model found. Run `stt meeting` to auto-download models."))?;
 
     eprintln!("Loading audio: {}", input.display());
-    let (samples, sample_rate) = sherpa_rs::read_audio_file(input.to_str().unwrap())
+    let input_str = input.to_str()
+        .ok_or_else(|| anyhow::anyhow!("Audio file path is not valid UTF-8: {}", input.display()))?;
+    let (samples, sample_rate) = sherpa_rs::read_audio_file(input_str)
         .map_err(|e| anyhow::anyhow!("Failed to read audio: {:?}", e))?;
 
     if sample_rate != 16000 {
@@ -635,8 +384,13 @@ fn transcribe_file(input: &Path, diarize: bool) -> Result<String> {
         );
     }
 
-    eprintln!("Transcribing {:.1}s of audio...", samples.len() as f32 / 16000.0);
-    let result = transcriber(&samples, sample_rate)?;
+    let duration = samples.len() as f32 / 16000.0;
+    eprintln!("Transcribing {:.1}s of audio with {} (Metal GPU)...", duration, model_name);
+    let start_time = Instant::now();
+    let n_threads = whisper_thread_count();
+    let result = whisper_transcribe(&model_path, &samples, n_threads)?;
+    let elapsed = start_time.elapsed();
+    eprintln!("  Transcribed in {:.1}s ({:.1}x realtime)", elapsed.as_secs_f64(), duration as f64 / elapsed.as_secs_f64());
 
     if !diarize || result.segments.is_empty() {
         return Ok(result.text);
@@ -656,9 +410,13 @@ fn transcribe_file(input: &Path, diarize: bool) -> Result<String> {
         num_clusters: None,
         ..Default::default()
     };
+    let seg_str = segmentation_model.to_str()
+        .ok_or_else(|| anyhow::anyhow!("Segmentation model path is not valid UTF-8"))?;
+    let emb_str = embedding_model.to_str()
+        .ok_or_else(|| anyhow::anyhow!("Embedding model path is not valid UTF-8"))?;
     let mut diarizer = sherpa_rs::diarize::Diarize::new(
-        segmentation_model.to_str().unwrap(),
-        embedding_model.to_str().unwrap(),
+        seg_str,
+        emb_str,
         diarize_config,
     ).map_err(|e| anyhow::anyhow!("Failed to create diarizer: {:?}", e))?;
 
@@ -685,54 +443,21 @@ fn transcribe_file(input: &Path, diarize: bool) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Post-Session Retranscription (Whisper Large V3)
+// Audio Muxing
 // ---------------------------------------------------------------------------
 
-/// Mux mic and system audio into mono, retranscribe with Whisper, and annotate source per segment.
-/// Replaces draft Kyutai segments in events.jsonl with accurate Whisper segments.
-fn retranscribe_with_large_v3(
-    session_dir: &Path,
-    mic_samples: &[f32],
-    sys_samples: &[f32],
-) -> Result<()> {
-    let models_dir = find_models_dir()?;
-
-    // Determine best model for parallel transcription
-    let large_v3_dir = models_dir.join("sherpa-onnx-whisper-large-v3");
-    let turbo_dir = models_dir.join("sherpa-onnx-whisper-turbo");
-
-    let (model_dir, model_variant, model_name) = if large_v3_dir.exists() {
-        (large_v3_dir, WhisperModel::LargeV3, "Whisper Large V3")
-    } else if turbo_dir.exists() {
-        (turbo_dir, WhisperModel::Turbo, "Whisper Turbo")
-    } else {
-        eprintln!("No Whisper model found, skipping retranscription");
-        return Ok(());
-    };
-    eprintln!("Using {} for retranscription", model_name);
-
-    let events_path = session_dir.join("events.jsonl");
-    if !events_path.exists() {
-        anyhow::bail!("Events file not found: {}", events_path.display());
-    }
-
-    // Backup draft events
-    let draft_path = session_dir.join("events.draft.jsonl");
-    std::fs::copy(&events_path, &draft_path)?;
-    eprintln!("Draft transcript backed up to events.draft.jsonl");
-
-    // Mux mic + sys into mono: (mic + sys) / 2, handling different lengths
+/// Mux mic and system audio into mono: (mic + sys) / 2, handling different lengths.
+/// Returns None if both channels are empty.
+fn mux_audio(mic_samples: &[f32], sys_samples: &[f32]) -> Option<Vec<f32>> {
     let has_mic = !mic_samples.is_empty();
     let has_sys = !sys_samples.is_empty();
     let mux_len = mic_samples.len().max(sys_samples.len());
 
     if mux_len == 0 {
-        eprintln!("No audio to retranscribe");
-        return Ok(());
+        return None;
     }
 
-    let muxed: Vec<f32> = if has_mic && has_sys {
-        eprintln!("Muxing mic + system audio ({:.1}s)...", mux_len as f32 / 16000.0);
+    let muxed = if has_mic && has_sys {
         (0..mux_len)
             .map(|i| {
                 let m = if i < mic_samples.len() { mic_samples[i] } else { 0.0 };
@@ -741,11 +466,51 @@ fn retranscribe_with_large_v3(
             })
             .collect()
     } else if has_mic {
-        eprintln!("Using mic audio only ({:.1}s)...", mic_samples.len() as f32 / 16000.0);
         mic_samples.to_vec()
     } else {
-        eprintln!("Using system audio only ({:.1}s)...", sys_samples.len() as f32 / 16000.0);
         sys_samples.to_vec()
+    };
+
+    Some(muxed)
+}
+
+// ---------------------------------------------------------------------------
+// Post-Session Retranscription (Whisper Turbo via whisper-rs, Metal GPU)
+// ---------------------------------------------------------------------------
+
+/// Retranscribe with Whisper and annotate source per segment.
+/// Replaces draft Kyutai segments in events.jsonl with accurate Whisper segments.
+/// Uses whisper-rs (whisper.cpp) with Metal GPU -- single pass, no manual chunking needed.
+fn retranscribe_with_whisper(
+    session_dir: &Path,
+    mic_samples: &[f32],
+    sys_samples: &[f32],
+) -> Result<()> {
+    let models_dir = find_models_dir()?;
+
+    let (model_path, model_name) = match find_whisper_model(&models_dir) {
+        Some(m) => m,
+        None => {
+            eprintln!("No Whisper model found, skipping retranscription");
+            return Ok(());
+        }
+    };
+    eprintln!("Using {} for retranscription (Metal GPU)", model_name);
+
+    let events_path = session_dir.join("events.jsonl");
+    if !events_path.exists() {
+        anyhow::bail!("Events file not found: {}", events_path.display());
+    }
+
+    let has_mic = !mic_samples.is_empty();
+    let has_sys = !sys_samples.is_empty();
+
+    let muxed = match mux_audio(mic_samples, sys_samples) {
+        Some(m) => m,
+        None => {
+            eprintln!("No audio to retranscribe");
+            return Ok(());
+        }
     };
 
     let duration = muxed.len() as f32 / 16000.0;
@@ -774,9 +539,18 @@ fn retranscribe_with_large_v3(
         .unwrap_or(0);
     let mut next_id: u64 = max_existing_id + 1;
 
-    // Parallel Whisper pass on muxed audio
-    match transcribe_parallel(&model_dir, model_variant, &muxed, 16000) {
+    // Single-pass Whisper transcription with Metal GPU
+    let n_threads = whisper_thread_count();
+    let start_time = Instant::now();
+    match whisper_transcribe(&model_path, &muxed, n_threads) {
         Ok(result) => {
+            let elapsed = start_time.elapsed();
+            eprintln!(
+                "  Transcribed in {:.1}s ({:.1}x realtime)",
+                elapsed.as_secs_f64(),
+                duration as f64 / elapsed.as_secs_f64()
+            );
+
             for seg in &result.segments {
                 let seg_text = seg.text.trim();
                 if seg_text.is_empty() {
@@ -789,7 +563,7 @@ fn retranscribe_with_large_v3(
                 // Annotate source: compute energy ratio from original channels
                 let src = if has_mic && has_sys {
                     let start_sample = (start_ms as usize) * 16;
-                    let end_sample = ((end_ms as usize) * 16).min(mux_len);
+                    let end_sample = ((end_ms as usize) * 16).min(muxed.len());
                     if start_sample < end_sample {
                         let mic_energy: f32 = mic_samples.get(start_sample..end_sample.min(mic_samples.len()))
                             .map(|s| s.iter().map(|x| x * x).sum())
@@ -846,7 +620,7 @@ fn retranscribe_with_large_v3(
 
     std::fs::write(&events_path, updated_content)?;
 
-    eprintln!("✓ Retranscribed with {} (draft saved to events.draft.jsonl)", model_name);
+    eprintln!("✓ Retranscribed with {} (Metal GPU) → events.jsonl", model_name);
 
     Ok(())
 }
@@ -868,28 +642,12 @@ fn run_diarization_from_memory(
         anyhow::bail!("Events file not found: {}", events_path.display());
     }
 
-    // Mux mic + sys for diarization
-    let has_mic = !mic_samples.is_empty();
-    let has_sys = !sys_samples.is_empty();
-    let mux_len = mic_samples.len().max(sys_samples.len());
-
-    if mux_len == 0 {
-        eprintln!("No audio captured, skipping diarization");
-        return Ok(());
-    }
-
-    let muxed: Vec<f32> = if has_mic && has_sys {
-        (0..mux_len)
-            .map(|i| {
-                let m = if i < mic_samples.len() { mic_samples[i] } else { 0.0 };
-                let s = if i < sys_samples.len() { sys_samples[i] } else { 0.0 };
-                (m + s) * 0.5
-            })
-            .collect()
-    } else if has_mic {
-        mic_samples.to_vec()
-    } else {
-        sys_samples.to_vec()
+    let muxed = match mux_audio(mic_samples, sys_samples) {
+        Some(m) => m,
+        None => {
+            eprintln!("No audio captured, skipping diarization");
+            return Ok(());
+        }
     };
 
     let models_dir = find_models_dir()?;
@@ -911,9 +669,13 @@ fn run_diarization_from_memory(
         num_clusters: None,
         ..Default::default()
     };
+    let seg_str = segmentation_model.to_str()
+        .ok_or_else(|| anyhow::anyhow!("Segmentation model path is not valid UTF-8"))?;
+    let emb_str = embedding_model.to_str()
+        .ok_or_else(|| anyhow::anyhow!("Embedding model path is not valid UTF-8"))?;
     let mut diarizer = sherpa_rs::diarize::Diarize::new(
-        segmentation_model.to_str().unwrap(),
-        embedding_model.to_str().unwrap(),
+        seg_str,
+        emb_str,
         diarize_config,
     ).map_err(|e| anyhow::anyhow!("Failed to create diarizer: {:?}", e))?;
 
@@ -966,9 +728,6 @@ fn run_diarization_from_memory(
     Ok(())
 }
 
-
-
-
 // ---------------------------------------------------------------------------
 // Summary Generation (Claude API)
 // ---------------------------------------------------------------------------
@@ -1000,11 +759,13 @@ Important statements worth highlighting (optional, only if significant).
 
 Format the output in clean Markdown."#;
 
-fn generate_summary(session_dir: &Path, anthropic_key: Option<&str>) -> Result<()> {
-    let events_path = session_dir.join("events.jsonl");
-    let context_path = session_dir.join("CONTEXT.md");
-    let prompt_path = session_dir.join("PROMPT.md");
-
+fn generate_summary(
+    events_path: &Path,
+    summary_path: &Path,
+    context_path: &Path,
+    prompt_path: &Path,
+    anthropic_key: Option<&str>,
+) -> Result<()> {
     if !events_path.exists() {
         anyhow::bail!("Events file not found: {}", events_path.display());
     }
@@ -1075,20 +836,32 @@ fn generate_summary(session_dir: &Path, anthropic_key: Option<&str>) -> Result<(
         "messages": [{"role": "user", "content": prompt}]
     });
 
-    let output = std::process::Command::new("curl")
-        .arg("-s")
-        .arg("-X")
-        .arg("POST")
+    // Use curl --config to pass headers via stdin so the API key
+    // doesn't appear in the process list (visible via `ps aux`).
+    let curl_config = format!(
+        "header = \"x-api-key: {}\"\n\
+         header = \"anthropic-version: 2023-06-01\"\n\
+         header = \"content-type: application/json\"",
+        api_key
+    );
+
+    let mut child = std::process::Command::new("curl")
+        .args(["-s", "-X", "POST"])
         .arg("https://api.anthropic.com/v1/messages")
-        .arg("-H")
-        .arg(format!("x-api-key: {}", api_key))
-        .arg("-H")
-        .arg("anthropic-version: 2023-06-01")
-        .arg("-H")
-        .arg("content-type: application/json")
+        .args(["--config", "-"])
         .arg("-d")
         .arg(request_body.to_string())
-        .output()?;
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(curl_config.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -1107,8 +880,7 @@ fn generate_summary(session_dir: &Path, anthropic_key: Option<&str>) -> Result<(
         .as_str()
         .unwrap_or("No summary generated");
 
-    let summary_path = session_dir.join("SUMMARY.md");
-    std::fs::write(&summary_path, summary)?;
+    std::fs::write(summary_path, summary)?;
 
     eprintln!("✓ Summary written to: {}", summary_path.display());
     Ok(())
@@ -1235,9 +1007,40 @@ fn run_listen_mode(device_name: Option<&str>, cpu: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    // If launched without a TTY (e.g. double-click from Finder), relaunch inside Terminal.
+    // The osascript call is attributed to STT.app (this binary) not "bash".
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 && std::env::args().len() == 1 {
+        let exe = std::env::current_exe()?;
+        // Escape backslashes and double quotes to prevent command injection
+        // in the AppleScript string literal.
+        let exe_escaped = exe.display().to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let script = format!(
+            "tell application \"Terminal\"\n  activate\n  do script \"{}\"\nend tell",
+            exe_escaped
+        );
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .status()?;
+        return Ok(());
+    }
+
     let args = Args::parse();
 
-    match args.command {
+    let command = args.command.unwrap_or(Commands::Meeting {
+        mic: None,
+        list_devices: false,
+        no_tui: false,
+        output: None,
+        no_diarize: false,
+        no_summary: false,
+        no_retranscribe: false,
+        anthropic_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+        meeting_title: None,
+    });
+
+    match command {
         Commands::File {
             input,
             output,
@@ -1271,6 +1074,7 @@ fn main() -> Result<()> {
             no_summary,
             no_retranscribe,
             anthropic_key,
+            meeting_title,
         } => {
             if list_devices {
                 list_audio_devices();
@@ -1286,7 +1090,7 @@ fn main() -> Result<()> {
 
             // Pass 1: Real-time TUI meeting mode (Kyutai STT streaming)
             let recorded_audio =
-                meeting::run_tui_meeting(mic.as_deref(), &session_folder, args.cpu)?;
+                meeting::run_tui_meeting(mic.as_deref(), &session_folder, args.cpu, meeting_title.as_deref())?;
 
             eprintln!(
                 "\nRecorded {:.1}s of audio ({:.1} MB in memory)",
@@ -1297,10 +1101,33 @@ fn main() -> Result<()> {
             // Post-processing pipeline
             eprintln!("\n--- Post-processing ---\n");
 
-            // Pass 2: Retranscribe with Whisper Large V3
+            let events_path = session_folder.join("events.jsonl");
+            let draft_path = session_folder.join("events.draft.jsonl");
+            let context_path = session_folder.join("CONTEXT.md");
+            let prompt_path = session_folder.join("PROMPT.md");
+
+            // Step 1: Back up the live (Kyutai) transcript
+            if events_path.exists() {
+                std::fs::copy(&events_path, &draft_path)?;
+                eprintln!("Live transcript saved to events.draft.jsonl");
+            }
+
+            // Step 2: Summarize the live transcript (for A/B comparison)
+            if !no_summary {
+                eprintln!("\nGenerating summary from live transcript (draft)...");
+                let draft_summary = session_folder.join("SUMMARY.draft.md");
+                if let Err(e) = generate_summary(
+                    &draft_path, &draft_summary, &context_path, &prompt_path,
+                    anthropic_key.as_deref(),
+                ) {
+                    eprintln!("Draft summary failed: {}", e);
+                }
+            }
+
+            // Step 3: Retranscribe with Whisper Turbo (overwrites events.jsonl)
             if !no_retranscribe {
-                eprintln!("Pass 2: Retranscribing with Whisper Large V3...");
-                if let Err(e) = retranscribe_with_large_v3(
+                eprintln!("\nPass 2: Retranscribing with Whisper (Metal GPU)...");
+                if let Err(e) = retranscribe_with_whisper(
                     &session_folder,
                     &recorded_audio.mic_samples,
                     &recorded_audio.sys_samples,
@@ -1309,7 +1136,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Speaker diarization
+            // Step 4: Speaker diarization (on events.jsonl, whichever version it is)
             if !no_diarize {
                 eprintln!("\nRunning speaker diarization...");
                 if let Err(e) = run_diarization_from_memory(
@@ -1321,10 +1148,14 @@ fn main() -> Result<()> {
                 }
             }
 
-            // AI summary
+            // Step 5: Summarize the final transcript (Whisper + diarization)
             if !no_summary {
-                eprintln!("\nGenerating AI summary...");
-                if let Err(e) = generate_summary(&session_folder, anthropic_key.as_deref()) {
+                eprintln!("\nGenerating summary from final transcript...");
+                let final_summary = session_folder.join("SUMMARY.md");
+                if let Err(e) = generate_summary(
+                    &events_path, &final_summary, &context_path, &prompt_path,
+                    anthropic_key.as_deref(),
+                ) {
                     eprintln!("Summary failed: {}", e);
                 }
             }

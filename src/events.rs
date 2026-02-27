@@ -40,6 +40,8 @@ pub enum Event {
         text: String,
         start_ms: u64,
         end_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        speaker: Option<String>,
     },
 
     /// User-inserted marker (e.g., ACTION_ITEM, DECISION)
@@ -137,6 +139,7 @@ mod tests {
             text: "Hello world".to_string(),
             start_ms: 5000,
             end_ms: 7500,
+            speaker: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();

@@ -107,7 +107,9 @@ impl KyutaiTranscriber {
             moshi::nn::MaybeQuantizedVarBuilder::Real(vb),
         )?;
 
-        let audio_tokenizer = moshi::mimi::load(mimi_file.to_str().unwrap(), Some(32), device)?;
+        let mimi_str = mimi_file.to_str()
+            .ok_or_else(|| anyhow::anyhow!("Mimi model path is not valid UTF-8"))?;
+        let audio_tokenizer = moshi::mimi::load(mimi_str, Some(32), device)?;
         let asr_delay = (config.stt_config.audio_delay_seconds * 12.5) as usize;
         let state = moshi::asr::State::new(batch_size, asr_delay, 0., audio_tokenizer, lm)?;
 

@@ -13,8 +13,25 @@ pub struct JsonlWriter {
 }
 
 impl JsonlWriter {
-    /// Create a new JSONL writer, creating or appending to the file
+    /// Create a new JSONL writer, creating or appending to the file.
+    /// Scans existing content to resume ID numbering from the max existing ID.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+
+        // Scan existing file for max ID to avoid collisions when appending
+        let next_id = if path.exists() {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let max_id = content.lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter_map(|v| v.get("id").and_then(|id| id.as_u64()))
+                .max()
+                .unwrap_or(0);
+            max_id + 1
+        } else {
+            1
+        };
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -22,7 +39,7 @@ impl JsonlWriter {
 
         Ok(Self {
             writer: BufWriter::new(file),
-            next_id: 1,
+            next_id,
         })
     }
 
@@ -75,6 +92,7 @@ mod tests {
                 text: "Hello".to_string(),
                 start_ms: 1000,
                 end_ms: 2000,
+                speaker: None,
             };
             writer.write(&event).unwrap();
         }

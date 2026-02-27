@@ -160,6 +160,7 @@ pub fn run_tui_meeting(
     mic_device: Option<&str>,
     session_folder: &Path,
     cpu: bool,
+    meeting_title: Option<&str>,
 ) -> Result<RecordedAudio> {
     // Create session folder structure
     std::fs::create_dir_all(session_folder)?;
@@ -222,6 +223,7 @@ pub fn run_tui_meeting(
         &events_path,
         &screenshots_dir,
         kyutai_stt,
+        meeting_title,
     )?;
 
     terminal.show_cursor()?;
@@ -235,6 +237,7 @@ fn run_meeting_loop(
     events_path: &Path,
     screenshots_dir: &Path,
     kyutai_stt: Option<KyutaiTranscriber>,
+    meeting_title: Option<&str>,
 ) -> Result<RecordedAudio> {
     let host = cpal::default_host();
 
@@ -267,7 +270,7 @@ fn run_meeting_loop(
 
     let session_id = format!("mtg_{}", Utc::now().format("%Y%m%d_%H%M%S"));
 
-    let mut app = App::new();
+    let mut app = App::new(meeting_title.map(String::from));
 
     // Write session start
     let start_event = Event::SessionStart {
@@ -286,6 +289,7 @@ fn run_meeting_loop(
     let (transcript_tx, transcript_rx) = mpsc::channel::<(AudioSource, String, u64, u64)>();
 
     let running = Arc::new(AtomicBool::new(true));
+    let paused = Arc::new(AtomicBool::new(false));
     ctrlc_handler(running.clone());
 
     // Setup ScreenCaptureKit
@@ -330,6 +334,7 @@ fn run_meeting_loop(
 
     // Spawn audio collection and transcription thread
     let running_clone = running.clone();
+    let paused_clone = paused.clone();
     let transcription_handle = std::thread::spawn(move || {
         run_audio_collection(
             mic_rx,
@@ -338,6 +343,7 @@ fn run_meeting_loop(
             sys_rate,
             transcript_tx,
             running_clone,
+            paused_clone,
             kyutai_stt,
         )
     });
@@ -434,6 +440,9 @@ fn run_meeting_loop(
                                 app.add_event(event);
                             }
                         }
+                        KeyAction::TogglePause => {
+                            paused.store(app.paused, Ordering::SeqCst);
+                        }
                         KeyAction::ImportImage(source_path) => {
                             if source_path.exists() {
                                 screenshot_count += 1;
@@ -471,6 +480,7 @@ fn run_meeting_loop(
                 text,
                 start_ms,
                 end_ms,
+                speaker: None,
             };
             writer.write(&event)?;
             app.add_event(event);
@@ -498,6 +508,7 @@ fn run_meeting_loop(
             text,
             start_ms,
             end_ms,
+            speaker: None,
         };
         writer.write(&event)?;
         app.add_event(event);
@@ -523,6 +534,7 @@ fn run_audio_collection(
     sys_rate: u32,
     transcript_tx: mpsc::Sender<(AudioSource, String, u64, u64)>,
     running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     mut kyutai_stt: Option<KyutaiTranscriber>,
 ) -> RecordedAudio {
     // Resamplers: native rate → 16kHz (for storage) and → 24kHz (for Kyutai)
@@ -546,6 +558,14 @@ fn run_audio_collection(
     let start_time = Instant::now();
 
     while running.load(Ordering::SeqCst) {
+        // When paused, drain channels to prevent backpressure but discard audio
+        if paused.load(Ordering::SeqCst) {
+            while mic_rx.try_recv().is_ok() {}
+            while sys_rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
         // Collect mic audio
         while let Ok(samples) = mic_rx.try_recv() {
             // Store at 16kHz for post-processing
