@@ -154,6 +154,28 @@ pub fn ctrlc_handler(running: Arc<AtomicBool>) {
     });
 }
 
+/// Run `screencapture` with the given flag (-i for region, -W for window).
+/// Temporarily leaves the alternate screen so the user can interact with the capture UI.
+fn run_screencapture(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    flag: &str,
+    filepath: &Path,
+) -> Result<bool> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    let status = Command::new("screencapture")
+        .arg(flag)
+        .arg(filepath)
+        .status();
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    Ok(status.is_ok() && filepath.exists())
+}
+
 /// Run meeting mode with TUI using Kyutai STT streaming (Pass 1)
 /// Returns RecordedAudio containing mic and system audio at 16kHz for post-processing
 pub fn run_tui_meeting(
@@ -385,23 +407,11 @@ fn run_meeting_loop(
                             app.add_event(event);
                         }
                         KeyAction::CaptureScreenshot => {
-                            disable_raw_mode()?;
-                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
                             screenshot_count += 1;
                             let filename = format!("{:03}.png", screenshot_count);
                             let filepath = screenshots_dir.join(&filename);
 
-                            let status = Command::new("screencapture")
-                                .arg("-i")
-                                .arg(&filepath)
-                                .status();
-
-                            enable_raw_mode()?;
-                            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                            terminal.clear()?;
-
-                            if status.is_ok() && filepath.exists() {
+                            if run_screencapture(terminal, "-i", &filepath)? {
                                 let event = Event::Screenshot {
                                     id: writer.next_id(),
                                     ts: Utc::now(),
@@ -413,23 +423,11 @@ fn run_meeting_loop(
                             }
                         }
                         KeyAction::CaptureWindowScreenshot => {
-                            disable_raw_mode()?;
-                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
                             screenshot_count += 1;
                             let filename = format!("{:03}.png", screenshot_count);
                             let filepath = screenshots_dir.join(&filename);
 
-                            let status = Command::new("screencapture")
-                                .arg("-W")
-                                .arg(&filepath)
-                                .status();
-
-                            enable_raw_mode()?;
-                            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                            terminal.clear()?;
-
-                            if status.is_ok() && filepath.exists() {
+                            if run_screencapture(terminal, "-W", &filepath)? {
                                 let event = Event::Screenshot {
                                     id: writer.next_id(),
                                     ts: Utc::now(),

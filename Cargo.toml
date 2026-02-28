@@ -21,7 +21,10 @@ crossterm = "0.28"
 dirs = "5"
 libc = "0.2"
 
-# STT and speaker embedding (post-session Whisper Large V3 + diarization)
+# Post-session Whisper Turbo retranscription (whisper.cpp with Metal GPU)
+whisper-rs = { version = "0.15", features = ["metal"] }
+
+# Speaker diarization (pyannote + 3dspeaker) and audio file reading
 sherpa-rs = { version = "0.6", features = ["download-binaries"] }
 
 # Kyutai STT streaming (real-time transcription)
@@ -31,7 +34,6 @@ candle-transformers = "0.9"
 moshi = "0.6"
 hf-hub = "0.4"
 sentencepiece = "0.11"
-kaudio = "0.2"
 
 [features]
 default = ["metal"]

@@ -97,6 +97,20 @@ enum Commands {
 }
 
 // ---------------------------------------------------------------------------
+// JSONL Helpers
+// ---------------------------------------------------------------------------
+
+/// Read a JSONL events file into a Vec of raw JSON values, skipping blank lines.
+fn read_events_jsonl(path: &Path) -> Result<Vec<serde_json::Value>> {
+    let content = std::fs::read_to_string(path)?;
+    let events = content.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect();
+    Ok(events)
+}
+
+// ---------------------------------------------------------------------------
 // Whisper Transcription (whisper-rs / whisper.cpp with Metal GPU)
 // ---------------------------------------------------------------------------
 
@@ -517,19 +531,11 @@ fn retranscribe_with_whisper(
     eprintln!("Retranscribing {:.1}s of audio...", duration);
 
     // Read all events, separate segments from non-segments
-    let events_content = std::fs::read_to_string(&events_path)?;
-    let mut non_segment_events: Vec<serde_json::Value> = Vec::new();
-
-    for line in events_content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
-            if event["type"] != "segment" {
-                non_segment_events.push(event);
-            }
-        }
-    }
+    let all_events = read_events_jsonl(&events_path)?;
+    let non_segment_events: Vec<serde_json::Value> = all_events
+        .into_iter()
+        .filter(|e| e["type"] != "segment")
+        .collect();
 
     let mut new_segments: Vec<serde_json::Value> = Vec::new();
     let max_existing_id = non_segment_events
@@ -696,16 +702,9 @@ fn run_diarization_from_memory(
     eprintln!("  {} speakers detected", speakers.len());
 
     // Align speaker labels onto Whisper transcript segments
-    let events_content = std::fs::read_to_string(&events_path)?;
-    let mut updated_events = Vec::new();
+    let mut events = read_events_jsonl(&events_path)?;
 
-    for line in events_content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let mut event: serde_json::Value = serde_json::from_str(line)?;
-
+    for event in &mut events {
         if event["type"] == "segment" {
             if let (Some(start_ms), Some(end_ms)) = (event["start_ms"].as_u64(), event["end_ms"].as_u64()) {
                 let seg_mid_secs = (start_ms + end_ms) as f32 / 2000.0;
@@ -718,11 +717,12 @@ fn run_diarization_from_memory(
                 }
             }
         }
-
-        updated_events.push(serde_json::to_string(&event)?);
     }
 
-    std::fs::write(&events_path, updated_events.join("\n") + "\n")?;
+    let updated: Vec<String> = events.iter()
+        .map(|e| serde_json::to_string(e).unwrap_or_default())
+        .collect();
+    std::fs::write(&events_path, updated.join("\n") + "\n")?;
     eprintln!("✓ Speaker labels written to events.jsonl");
 
     Ok(())
@@ -731,6 +731,8 @@ fn run_diarization_from_memory(
 // ---------------------------------------------------------------------------
 // Summary Generation (Claude API)
 // ---------------------------------------------------------------------------
+
+const SUMMARY_MODEL: &str = "claude-sonnet-4-20250514";
 
 const DEFAULT_SUMMARY_PROMPT: &str = r#"Please provide a comprehensive summary of this meeting transcript.
 
@@ -794,27 +796,22 @@ fn generate_summary(
         None
     };
 
-    let events_content = std::fs::read_to_string(&events_path)?;
+    let events = read_events_jsonl(events_path)?;
     let mut transcript_lines = Vec::new();
 
-    for line in events_content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
-            if event["type"] == "segment" {
-                let speaker = event["speaker"]
-                    .as_str()
-                    .unwrap_or(if event["src"] == "mic" { "ME" } else { "REMOTE" });
-                let text = event["text"].as_str().unwrap_or("");
-                transcript_lines.push(format!("[{}]: {}", speaker, text));
-            } else if event["type"] == "marker" {
-                let label = event["label"].as_str().unwrap_or("");
-                transcript_lines.push(format!("[MARKER]: {}", label));
-            } else if event["type"] == "manual" {
-                let text = event["text"].as_str().unwrap_or("");
-                transcript_lines.push(format!("[NOTE]: {}", text));
-            }
+    for event in &events {
+        if event["type"] == "segment" {
+            let speaker = event["speaker"]
+                .as_str()
+                .unwrap_or(if event["src"] == "mic" { "ME" } else { "REMOTE" });
+            let text = event["text"].as_str().unwrap_or("");
+            transcript_lines.push(format!("[{}]: {}", speaker, text));
+        } else if event["type"] == "marker" {
+            let label = event["label"].as_str().unwrap_or("");
+            transcript_lines.push(format!("[MARKER]: {}", label));
+        } else if event["type"] == "manual" {
+            let text = event["text"].as_str().unwrap_or("");
+            transcript_lines.push(format!("[NOTE]: {}", text));
         }
     }
 
@@ -831,7 +828,7 @@ fn generate_summary(
     };
 
     let request_body = serde_json::json!({
-        "model": "claude-sonnet-4-20250514",
+        "model": SUMMARY_MODEL,
         "max_tokens": 4096,
         "messages": [{"role": "user", "content": prompt}]
     });
